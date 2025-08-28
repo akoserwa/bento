@@ -1,0 +1,58 @@
+input:
+  generate:
+    interval: 5s
+    mapping: 'root = { "service": "" }'
+
+output:
+  type: grpc_client
+  grpc_client:
+    rpc_type: unary
+    address: 127.0.0.1:50051
+    method: /grpc.health.v1.Health/Check
+    tls:
+      enabled: false
+    # For production, enable TLS with proper certificates:
+    # tls_skip_verify: false
+    # tls_server_name: my-grpc-service.com
+    # tls_ca_cert: /path/to/ca.crt
+    
+    # Connection settings
+    authority: ""
+    user_agent: bento-healthcheck-example
+    load_balancing_policy: pick_first
+    
+    # Timeouts optimized for health checks
+    call_timeout: 5s
+    max_send_msg_bytes: 1024    # Small health check requests
+    max_recv_msg_bytes: 1024    # Small health check responses
+    
+    # Performance settings for frequent health checks
+    max_connection_pool_size: 2
+    connection_idle_timeout: 30m
+    enable_message_pool: true
+    
+    # Keep-alive for health check connections
+    keepalive_time: 30s
+    keepalive_timeout: 5s
+    keepalive_permit_without_stream: true
+    
+    # gRPC best practices
+    enable_interceptors: true
+    propagate_deadlines: true
+    
+    # Retry policy for health checks
+    retry_max_attempts: 3
+    retry_initial_backoff: 500ms
+    retry_max_backoff: 5s
+    retry_backoff_multiplier: 2.0
+    
+    # Authentication headers (commented out for local testing)
+    # auth_headers:
+    #   authorization: "Bearer your-token-here"
+    #   x-api-key: "your-api-key"
+    
+    # Metadata for health check identification
+    default_metadata:
+      client-type: bento-health-checker
+      check-interval: "5s"
+

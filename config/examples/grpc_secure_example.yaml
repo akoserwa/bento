@@ -1,0 +1,66 @@
+# Example showing secure gRPC configuration with TLS and authentication
+input:
+  generate:
+    interval: 10s
+    mapping: 'root = { "request_id": uuid_v4(), "timestamp": now() }'
+
+output:
+  type: grpc_client
+  grpc_client:
+    rpc_type: unary
+    address: secure-grpc-service.example.com:443
+    method: /api.SecureService/Process
+    
+    # Enhanced TLS security configuration
+    tls:
+      enabled: true
+    tls_skip_verify: false              # Always verify certificates in production
+    tls_server_name: secure-grpc-service.example.com
+    tls_ca_cert: /etc/ssl/certs/ca.crt  # Custom CA certificate
+    tls_client_cert: /etc/ssl/certs/client.crt  # Mutual TLS client certificate
+    tls_client_key: /etc/ssl/private/client.key # Mutual TLS client private key
+    
+    # Force transport security even for localhost
+    require_transport_security: true
+    
+    # Authentication
+    bearer_token: "${!env:GRPC_AUTH_TOKEN}"
+    auth_headers:
+      x-api-key: "${!env:API_KEY}"
+      x-client-id: "bento-secure-client"
+    
+    # Connection settings
+    authority: secure-grpc-service.example.com
+    user_agent: bento-secure-client/1.0
+    load_balancing_policy: round_robin
+    
+    # Timeouts and limits
+    call_timeout: 30s
+    max_send_msg_bytes: 1048576   # 1MB
+    max_recv_msg_bytes: 1048576   # 1MB
+    
+    # Performance optimizations
+    max_connection_pool_size: 5
+    connection_idle_timeout: 15m
+    enable_message_pool: true
+    
+    # Keep-alive for long-lived connections
+    keepalive_time: 60s
+    keepalive_timeout: 10s
+    keepalive_permit_without_stream: true
+    
+    # gRPC best practices
+    enable_interceptors: true
+    propagate_deadlines: true
+    
+    # Robust retry policy
+    retry_max_attempts: 5
+    retry_initial_backoff: 1s
+    retry_max_backoff: 60s
+    retry_backoff_multiplier: 2.0
+    
+    # Request metadata
+    default_metadata:
+      client-type: bento-secure
+      environment: production
+      trace-enabled: "true"
