@@ -2,12 +2,11 @@ package grpc_client
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"net"
-	"os"
+	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	_ "google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -26,38 +26,154 @@ import (
 	"github.com/jhump/protoreflect/grpcreflect"
 
 	"github.com/warpstreamlabs/bento/public/service"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // Common config field names
 const (
-	fieldAddress            = "address"
-	fieldMethod             = "method"
-	fieldRPCType            = "rpc_type"
-	fieldRequestJSON        = "request_json"
-	fieldTLS                = "tls"
+	fieldAddress     = "address"
+	fieldMethod      = "method"
+	fieldRPCType     = "rpc_type"
+	fieldRequestJSON = "request_json"
 )
+
+// createBaseConfigSpec creates the common configuration fields shared between input and output
+func createBaseConfigSpec() *service.ConfigSpec {
+	spec := service.NewConfigSpec().
+		Version("1.11.0").
+		Categories("Services").
+		Field(service.NewStringField(fieldAddress).Default("127.0.0.1:50051")).
+		Field(service.NewStringField(fieldMethod).Description("Full method name, e.g. /pkg.Service/Method")).
+		// Auth
+		Field(service.NewStringField("bearer_token").Secret().Optional()).
+		Field(service.NewStringMapField("auth_headers").Optional()).
+		// Connection
+		Field(service.NewStringField("authority").Optional()).
+		Field(service.NewStringField("user_agent").Optional()).
+		Field(service.NewStringField("load_balancing_policy").Default("pick_first")).
+		Field(service.NewIntField("max_send_msg_bytes").Default(0)).
+		Field(service.NewIntField("max_recv_msg_bytes").Default(0)).
+		Field(service.NewDurationField("keepalive_time").Default("0s")).
+		Field(service.NewDurationField("keepalive_timeout").Default("0s")).
+		Field(service.NewBoolField("keepalive_permit_without_stream").Default(false)).
+		Field(service.NewDurationField("call_timeout").Default("0s")).
+		Field(service.NewStringListField("proto_files").Optional()).
+		Field(service.NewStringListField("include_paths").Optional()).
+		// Performance
+		Field(service.NewIntField("max_connection_pool_size").Default(1)).
+		Field(service.NewDurationField("connection_idle_timeout").Default("30m")).
+		Field(service.NewBoolField("enable_message_pool").Default(false)).
+		// Best practices / metadata
+		Field(service.NewBoolField("enable_interceptors").Default(true)).
+		Field(service.NewBoolField("propagate_deadlines").Default(true)).
+		Field(service.NewStringMapField("default_metadata").Optional()).
+		Field(service.NewStringMapField("default_metadata_bin").Optional()).
+		// Retry policy
+		Field(service.NewIntField("retry_max_attempts").Default(0)).
+		Field(service.NewDurationField("retry_initial_backoff").Default("1s")).
+		Field(service.NewDurationField("retry_max_backoff").Default("30s")).
+		Field(service.NewFloatField("retry_backoff_multiplier").Default(2.0)).
+		// JSON / compression
+		Field(service.NewBoolField("json_emit_defaults").Default(false)).
+		Field(service.NewBoolField("json_use_proto_names").Default(false)).
+		Field(service.NewBoolField("json_discard_unknown").Default(false)).
+		Field(service.NewStringField("compression").Optional()).
+		// Circuit breaker
+		Field(service.NewIntField("circuit_breaker_failure_threshold").Default(5)).
+		Field(service.NewDurationField("circuit_breaker_reset_timeout").Default("30s")).
+		Field(service.NewIntField("circuit_breaker_half_open_max").Default(3)).
+		// Logging levels
+		Field(service.NewStringField("log_level_success").Default("debug")).
+		Field(service.NewStringField("log_level_error").Default("debug"))
+
+	return spec
+}
+
+// enhanceCallContext enhances the context for gRPC calls with proper deadline and metadata handling
+func enhanceCallContext(ctx context.Context, cfg *Config, injectMetadata func(context.Context) context.Context) context.Context {
+	// Derive from incoming context; do not use context.Background()
+	enhancedCtx := ctx
+	// Gate metadata injection to avoid duplication when interceptors are enabled
+	if !cfg.EnableInterceptors {
+		enhancedCtx = injectMetadata(enhancedCtx)
+	}
+	return enhancedCtx
+}
+
+// injectMetadataIntoContext adds default_metadata and auth_headers to the gRPC context
+func injectMetadataIntoContext(ctx context.Context, cfg *Config) context.Context {
+	// Collect all metadata to inject
+	md := make(map[string]string)
+
+	// Add default metadata from config
+	if len(cfg.DefaultMetadata) > 0 {
+		for k, v := range cfg.DefaultMetadata {
+			md[k] = v
+		}
+	}
+
+	// Add auth headers from config
+	if len(cfg.AuthHeaders) > 0 {
+		for k, v := range cfg.AuthHeaders {
+			md[k] = v
+		}
+	}
+
+	// Add bearer token if configured
+	if cfg.BearerToken != "" {
+		md["authorization"] = "Bearer " + cfg.BearerToken
+	}
+
+	// If we have metadata to inject, add it to the context
+	if len(md) > 0 || len(cfg.DefaultMetadataBin) > 0 {
+		// Get existing metadata if any
+		existingMD, ok := metadata.FromOutgoingContext(ctx)
+		var merged metadata.MD
+		if ok {
+			merged = existingMD.Copy()
+		} else {
+			merged = metadata.MD{}
+		}
+
+		// Add string metadata
+		for k, v := range md {
+			merged.Set(k, v)
+		}
+
+		// Add binary metadata
+		for k, v := range cfg.DefaultMetadataBin {
+			if decoded, err := base64.StdEncoding.DecodeString(v); err == nil {
+				merged.Append(k, string(decoded))
+			} else {
+				merged.Append(k, v)
+			}
+		}
+
+		ctx = metadata.NewOutgoingContext(ctx, merged)
+	}
+
+	return ctx
+}
 
 // Default timing configuration constants
 const (
-	defaultRetryBackoffInitial      = time.Second
-	defaultRetryBackoffMax          = 30 * time.Second
-	defaultConnectionIdleTimeout    = 30 * time.Minute
-	defaultSessionSweepInterval     = time.Minute
-	defaultConnectionPoolSize       = 1
-	defaultRetryMultiplier          = 2.0
-	defaultConnectionReleaseDelay   = 100 * time.Millisecond
-	defaultCleanupTickerInterval    = time.Minute
-	defaultHealthCheckInterval      = 30 * time.Second
-	defaultMaxConnectionFailures    = 3
-	defaultFailureWindow            = 5 * time.Minute
+	defaultRetryBackoffInitial    = time.Second
+	defaultRetryBackoffMax        = 30 * time.Second
+	defaultConnectionIdleTimeout  = 30 * time.Minute
+	defaultSessionSweepInterval   = time.Minute
+	defaultConnectionPoolSize     = 1
+	defaultRetryMultiplier        = 2.0
+	defaultConnectionReleaseDelay = 100 * time.Millisecond
+	defaultCleanupTickerInterval  = time.Minute
+	defaultHealthCheckInterval    = 30 * time.Second
+	defaultMaxConnectionFailures  = 3
+	defaultFailureWindow          = 5 * time.Minute
 )
 
 // Magic numbers for message sizes and limits
 const (
-	defaultMaxConnectionPoolSize = 1
-	minMethodNameLength          = 3  // Minimum: "/a/b"
-	maxLineLength                = 2000  // Maximum characters per line
-	maxReadLines                 = 2000  // Maximum lines to read
+	minMethodNameLength = 3 // Minimum: "/a/b"
 )
 
 // Config represents shared gRPC client configuration
@@ -66,8 +182,6 @@ type Config struct {
 	Method              string
 	RPCType             string
 	RequestJSON         string
-	TLSConfig           *tls.Config
-	TLSEnabled          bool
 	BearerToken         string
 	AuthHeaders         map[string]string
 	Authority           string
@@ -79,39 +193,64 @@ type Config struct {
 	KeepAliveTimeout    time.Duration
 	KeepAlivePermit     bool
 	CallTimeout         time.Duration
+	ConnectTimeout      time.Duration
 	ProtoFiles          []string
 	IncludePaths        []string
 	SessionKeyMeta      string
 	SessionIdleTimeout  time.Duration
 	SessionMaxLifetime  time.Duration
 	LogResponses        bool
-	
-	// Security enhancements
-	TLSSkipVerify       bool
-	TLSServerName       string
-	TLSCACert           string
-	TLSClientCert       string
-	TLSClientKey        string
-	RequireTransportSecurity bool
-	
+
 	// Performance options
-	MaxConnectionPoolSize int
-	ConnectionIdleTimeout time.Duration
-	EnableMessagePool     bool
-	
+	MaxConnectionPoolSize         int
+	ConnectionIdleTimeout         time.Duration
+	EnableMessagePool             bool
+	ConnectionCleanupInterval     time.Duration
+	ConnectionHealthcheckInterval time.Duration
+	ConnectionMaxLifetime         time.Duration
+
 	// gRPC best practices
-	EnableInterceptors    bool
-	PropagateDeadlines    bool
-	RetryPolicy           *RetryPolicy
-	DefaultMetadata       map[string]string
+	EnableInterceptors bool
+	PropagateDeadlines bool
+	RetryPolicy        *RetryPolicy
+	DefaultMetadata    map[string]string
+	DefaultMetadataBin map[string]string
+
+	// JSON options (grpcurl-like)
+	JSONEmitDefaults   bool
+	JSONUseProtoNames  bool
+	JSONDiscardUnknown bool
+
+	// Compression (e.g. "gzip")
+	Compression string
+
+	// Circuit breaker options (optional)
+	CircuitBreakerFailureThreshold int
+	CircuitBreakerResetTimeout     time.Duration
+	CircuitBreakerHalfOpenMax      int
+
+	// Logging levels for events
+	LogLevelSuccess string // debug|info|warn
+	LogLevelError   string // debug|info|warn
+
+	// Optional call observer for outcomes
+	Observer CallObserver
+
+	// Logger for shared components
+	Logger *service.Logger
+}
+
+// CallObserver receives outcomes of calls
+type CallObserver interface {
+	RecordCall(err error)
 }
 
 // RetryPolicy defines retry behavior for gRPC calls
 type RetryPolicy struct {
-	MaxAttempts     int
-	InitialBackoff  time.Duration
-	MaxBackoff      time.Duration
-	BackoffMultiplier float64
+	MaxAttempts          int
+	InitialBackoff       time.Duration
+	MaxBackoff           time.Duration
+	BackoffMultiplier    float64
 	RetryableStatusCodes []codes.Code
 }
 
@@ -123,7 +262,7 @@ type ServiceConfig struct {
 
 // MethodConfig represents method-specific configuration
 type MethodConfig struct {
-	Name        []MethodName     `json:"name"`
+	Name        []MethodName        `json:"name"`
 	RetryPolicy *ServiceRetryPolicy `json:"retryPolicy,omitempty"`
 }
 
@@ -146,52 +285,41 @@ type ServiceRetryPolicy struct {
 type StatusCodeStr string
 
 // NewStatusCodeStr creates a StatusCodeStr from a gRPC codes.Code
-func NewStatusCodeStr(code codes.Code) StatusCodeStr {
-	return StatusCodeStr(code.String())
-}
+func NewStatusCodeStr(code codes.Code) StatusCodeStr { return StatusCodeStr(code.String()) }
 
 // MarshalJSON implements json.Marshaler for proper gRPC service config format
-func (s StatusCodeStr) MarshalJSON() ([]byte, error) {
-	// gRPC service config expects uppercase status codes without quotes
-	return []byte(string(s)), nil
-}
+func (s StatusCodeStr) MarshalJSON() ([]byte, error) { return []byte(string(s)), nil }
 
 // ParseConfigFromService extracts gRPC configuration from service config
 func ParseConfigFromService(conf *service.ParsedConfig) (*Config, error) {
 	cfg := &Config{}
-	
+
 	// Extract core configuration
 	extractCoreConfig(conf, cfg)
-	
-	// Extract TLS configuration
-	extractTLSConfig(conf, cfg)
-	
+
 	// Extract authentication configuration
 	extractAuthConfig(conf, cfg)
-	
+
 	// Extract connection configuration
 	extractConnectionConfig(conf, cfg)
-	
+
 	// Extract streaming configuration
 	extractStreamingConfig(conf, cfg)
-	
-	// Extract security configuration
-	extractSecurityConfig(conf, cfg)
-	
+
 	// Extract performance configuration
 	extractPerformanceConfig(conf, cfg)
-	
+
 	// Extract gRPC best practices configuration
 	extractBestPracticesConfig(conf, cfg)
-	
+
 	// Extract retry policy configuration
 	extractRetryPolicyConfig(conf, cfg)
-	
+
 	// Enhanced security validation
 	if err := validateSecurityConfig(cfg); err != nil {
 		return nil, fmt.Errorf("security validation failed: %w", err)
 	}
-	
+
 	return cfg, nil
 }
 
@@ -201,16 +329,6 @@ func extractCoreConfig(conf *service.ParsedConfig, cfg *Config) {
 	cfg.Method, _ = conf.FieldString(fieldMethod)
 	cfg.RPCType, _ = conf.FieldString(fieldRPCType)
 	cfg.RequestJSON, _ = conf.FieldString(fieldRequestJSON)
-}
-
-// extractTLSConfig extracts TLS-related configuration
-func extractTLSConfig(conf *service.ParsedConfig, cfg *Config) {
-	var tlsEnabled bool
-	cfg.TLSConfig, tlsEnabled, _ = conf.FieldTLSToggled(fieldTLS)
-	if !tlsEnabled {
-		cfg.TLSConfig = nil
-	}
-	cfg.TLSEnabled = tlsEnabled
 }
 
 // extractAuthConfig extracts authentication configuration
@@ -230,8 +348,10 @@ func extractConnectionConfig(conf *service.ParsedConfig, cfg *Config) {
 	cfg.KeepAliveTimeout, _ = conf.FieldDuration("keepalive_timeout")
 	cfg.KeepAlivePermit, _ = conf.FieldBool("keepalive_permit_without_stream")
 	cfg.CallTimeout, _ = conf.FieldDuration("call_timeout")
+	cfg.ConnectTimeout, _ = conf.FieldDuration("connect_timeout")
 	cfg.ProtoFiles, _ = conf.FieldStringList("proto_files")
 	cfg.IncludePaths, _ = conf.FieldStringList("include_paths")
+	cfg.Compression, _ = conf.FieldString("compression")
 }
 
 // extractStreamingConfig extracts streaming-specific configuration
@@ -244,12 +364,13 @@ func extractStreamingConfig(conf *service.ParsedConfig, cfg *Config) {
 
 // extractSecurityConfig extracts security enhancement configuration
 func extractSecurityConfig(conf *service.ParsedConfig, cfg *Config) {
-	cfg.TLSSkipVerify, _ = conf.FieldBool("tls_skip_verify")
-	cfg.TLSServerName, _ = conf.FieldString("tls_server_name")
-	cfg.TLSCACert, _ = conf.FieldString("tls_ca_cert")
-	cfg.TLSClientCert, _ = conf.FieldString("tls_client_cert")
-	cfg.TLSClientKey, _ = conf.FieldString("tls_client_key")
-	cfg.RequireTransportSecurity, _ = conf.FieldBool("require_transport_security")
+	cfg.EnableInterceptors, _ = conf.FieldBool("enable_interceptors")
+	cfg.PropagateDeadlines, _ = conf.FieldBool("propagate_deadlines")
+	cfg.DefaultMetadata, _ = conf.FieldStringMap("default_metadata")
+	cfg.DefaultMetadataBin, _ = conf.FieldStringMap("default_metadata_bin")
+	cfg.JSONEmitDefaults, _ = conf.FieldBool("json_emit_defaults")
+	cfg.JSONUseProtoNames, _ = conf.FieldBool("json_use_proto_names")
+	cfg.JSONDiscardUnknown, _ = conf.FieldBool("json_discard_unknown")
 }
 
 // extractPerformanceConfig extracts performance optimization configuration
@@ -263,6 +384,15 @@ func extractPerformanceConfig(conf *service.ParsedConfig, cfg *Config) {
 		cfg.ConnectionIdleTimeout = defaultConnectionIdleTimeout
 	}
 	cfg.EnableMessagePool, _ = conf.FieldBool("enable_message_pool")
+	cfg.ConnectionCleanupInterval, _ = conf.FieldDuration("connection_cleanup_interval")
+	if cfg.ConnectionCleanupInterval <= 0 {
+		cfg.ConnectionCleanupInterval = defaultCleanupTickerInterval
+	}
+	cfg.ConnectionHealthcheckInterval, _ = conf.FieldDuration("connection_healthcheck_interval")
+	if cfg.ConnectionHealthcheckInterval <= 0 {
+		cfg.ConnectionHealthcheckInterval = defaultHealthCheckInterval
+	}
+	cfg.ConnectionMaxLifetime, _ = conf.FieldDuration("connection_max_lifetime")
 }
 
 // extractBestPracticesConfig extracts gRPC best practices configuration
@@ -270,6 +400,12 @@ func extractBestPracticesConfig(conf *service.ParsedConfig, cfg *Config) {
 	cfg.EnableInterceptors, _ = conf.FieldBool("enable_interceptors")
 	cfg.PropagateDeadlines, _ = conf.FieldBool("propagate_deadlines")
 	cfg.DefaultMetadata, _ = conf.FieldStringMap("default_metadata")
+	cfg.DefaultMetadataBin, _ = conf.FieldStringMap("default_metadata_bin")
+	cfg.JSONEmitDefaults, _ = conf.FieldBool("json_emit_defaults")
+	cfg.JSONUseProtoNames, _ = conf.FieldBool("json_use_proto_names")
+	cfg.JSONDiscardUnknown, _ = conf.FieldBool("json_discard_unknown")
+	cfg.LogLevelSuccess, _ = conf.FieldString("log_level_success")
+	cfg.LogLevelError, _ = conf.FieldString("log_level_error")
 }
 
 // extractRetryPolicyConfig extracts retry policy configuration
@@ -283,17 +419,17 @@ func extractRetryPolicyConfig(conf *service.ParsedConfig, cfg *Config) {
 	if retryInitialBackoff <= 0 {
 		retryInitialBackoff = defaultRetryBackoffInitial
 	}
-	
+
 	retryMaxBackoff, _ := conf.FieldDuration("retry_max_backoff")
 	if retryMaxBackoff <= 0 {
 		retryMaxBackoff = defaultRetryBackoffMax
 	}
-	
+
 	retryMultiplier := defaultRetryMultiplier
 	if multiplier, _ := conf.FieldFloat("retry_backoff_multiplier"); multiplier > 0 {
 		retryMultiplier = multiplier
 	}
-	
+
 	cfg.RetryPolicy = &RetryPolicy{
 		MaxAttempts:       maxAttempts,
 		InitialBackoff:    retryInitialBackoff,
@@ -310,88 +446,152 @@ func extractRetryPolicyConfig(conf *service.ParsedConfig, cfg *Config) {
 
 // validateSecurityConfig performs comprehensive security validation
 func validateSecurityConfig(cfg *Config) error {
-	// Validate auth requirements
-	if (cfg.BearerToken != "" || len(cfg.AuthHeaders) > 0) {
-		if !cfg.TLSEnabled && !cfg.RequireTransportSecurity {
-			return fmt.Errorf("bearer_token/auth_headers require TLS to be enabled")
-		}
+	// Do not enforce TLS while disabled
+	if err := validateSecurityHeaders(cfg.AuthHeaders); err != nil {
+		return fmt.Errorf("security header validation failed: %w", err)
 	}
-	
-	// Validate TLS certificate configuration
-	if cfg.TLSEnabled && cfg.TLSConfig != nil {
-		if cfg.TLSClientCert != "" || cfg.TLSClientKey != "" {
-			if cfg.TLSClientCert == "" || cfg.TLSClientKey == "" {
-				return fmt.Errorf("both tls_client_cert and tls_client_key must be provided for mutual TLS")
-			}
-		}
-		
-		// Validate certificate files exist and are readable
-		if cfg.TLSCACert != "" {
-			if err := validateCertificateFile(cfg.TLSCACert); err != nil {
-				return fmt.Errorf("invalid CA certificate: %w", err)
-			}
-		}
-		
-		if cfg.TLSClientCert != "" {
-			if err := validateCertificateFile(cfg.TLSClientCert); err != nil {
-				return fmt.Errorf("invalid client certificate: %w", err)
-			}
-		}
-	}
-	
-	// Warn about insecure configurations
-	if cfg.TLSSkipVerify {
-		// Log warning about insecure configuration
-	}
-	
 	return nil
 }
 
-// validateCertificateFile validates that a certificate file is readable and valid
-func validateCertificateFile(filepath string) error {
-	// For now, just check if file path is not empty
-	// In a production implementation, we would:
-	// 1. Check if file exists and is readable
-	// 2. Parse the certificate to ensure it's valid
-	// 3. Check certificate expiration
-	if filepath == "" {
-		return fmt.Errorf("certificate file path cannot be empty")
+// validateSecurityHeaders validates that custom headers don't contain sensitive information or security risks
+func validateSecurityHeaders(headers map[string]string) error {
+	if len(headers) == 0 {
+		return nil
 	}
+
+	// List of potentially dangerous headers that should not be set by users
+	dangerousHeaders := map[string]bool{
+		"authorization":     true,
+		"cookie":            true,
+		"set-cookie":        true,
+		"x-forwarded-for":   true,
+		"x-real-ip":         true,
+		"x-client-ip":       true,
+		"x-forwarded-host":  true,
+		"x-forwarded-proto": true,
+		"x-forwarded-port":  true,
+		"x-original-uri":    true,
+		"x-original-url":    true,
+		"x-scheme":          true,
+		"x-request-id":      true,
+		"traceparent":       true,
+		"tracestate":        true,
+	}
+
+	for header := range headers {
+		headerLower := strings.ToLower(header)
+		if dangerousHeaders[headerLower] {
+			return fmt.Errorf("header '%s' is not allowed in auth_headers as it may conflict with internal headers or pose security risks", header)
+		}
+
+		// Check for headers that might contain sensitive information
+		if strings.Contains(headerLower, "password") ||
+			strings.Contains(headerLower, "secret") ||
+			strings.Contains(headerLower, "token") ||
+			strings.Contains(headerLower, "key") {
+			// Sensitive header name detected; continue but do not log here
+		}
+	}
+
 	return nil
 }
 
 // headerCreds implements credentials.PerRPCCredentials with enhanced security
 type headerCreds struct {
-	token               string
-	headers             map[string]string
-	requireTransportSec bool
-	tlsEnabled          bool
+	token      string
+	headers    map[string]string
+	tlsEnabled bool
 }
 
 func (h headerCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
-	md := map[string]string{}
-	
+	md := make(map[string]string)
+
 	// Add authorization token if present
 	if h.token != "" {
 		md["authorization"] = "Bearer " + h.token
 	}
-	
-	// Add custom headers
+
+	// Add custom headers with security validation
 	for k, v := range h.headers {
+		if err := validateHeaderName(k); err != nil {
+			// Log the error but continue (don't fail the entire request)
+			// Logger not available in this scope
+			continue
+		}
+		if err := validateHeaderValue(v); err != nil {
+			// Log the error but continue (don't fail the entire request)
+			// Logger not available in this scope
+			continue
+		}
 		md[k] = v
 	}
-	
+
 	return md, nil
+}
+
+// validateHeaderName validates that a header name is safe and properly formatted
+func validateHeaderName(name string) error {
+	if name == "" {
+		return fmt.Errorf("header name cannot be empty")
+	}
+
+	if len(name) > 128 {
+		return fmt.Errorf("header name is too long (maximum 128 characters)")
+	}
+
+	// Header names must follow HTTP header naming rules
+	for i, char := range name {
+		if i == 0 {
+			// First character must be a letter or digit
+			if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')) {
+				return fmt.Errorf("header name must start with a letter or digit")
+			}
+		} else {
+			// Subsequent characters can be letters, digits, or hyphens
+			if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') || char == '-') {
+				return fmt.Errorf("header name contains invalid character: %c", char)
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateHeaderValue validates that a header value is safe
+func validateHeaderValue(value string) error {
+	if len(value) > 4096 {
+		return fmt.Errorf("header value is too long (maximum 4096 characters)")
+	}
+
+	// Check for control characters that could be used for header injection
+	for _, char := range value {
+		if char < 32 && char != '\t' {
+			return fmt.Errorf("header value contains control character")
+		}
+		if char == '\r' || char == '\n' {
+			return fmt.Errorf("header value contains CRLF characters (potential header injection)")
+		}
+	}
+
+	return nil
 }
 
 func (h headerCreds) RequireTransportSecurity() bool {
 	// Return true if TLS is enabled OR transport security is explicitly required
 	// This fixes the security issue where secureOnly was hardcoded to true
-	return h.tlsEnabled || h.requireTransportSec
+	return h.tlsEnabled
 }
 
+// context key for connection manager
+type ctxKey int
+
+const (
+	ctxKeyConnMgr ctxKey = iota
+)
+
 // ConnectionPool manages a pool of gRPC connections for performance optimization.
-// 
+//
 // The pool implements a round-robin connection selection strategy with automatic
 // connection release. Connections are marked as "in use" temporarily to prevent
 // concurrent access conflicts, then automatically released after a short delay.
@@ -402,22 +602,160 @@ func (h headerCreds) RequireTransportSecurity() bool {
 // Lifecycle: Connections are created during pool initialization and replaced
 // when they become idle beyond the configured timeout.
 type ConnectionPool struct {
-	connections []connectionEntry  // Pool of gRPC connections
-	mu          sync.RWMutex       // Protects concurrent access to pool state
-	cfg         *Config            // Configuration for connection management
-	nextIndex   int                // Round-robin index for connection selection
-	closed      bool               // Indicates if pool is closed
+	connections []connectionEntry // Pool of gRPC connections
+	mu          sync.RWMutex      // Protects concurrent access to pool state
+	cfg         *Config           // Configuration for connection management
+	nextIndex   int               // Round-robin index for connection selection
+	closed      bool              // Indicates if pool is closed
 }
 
 // connectionEntry represents a single gRPC connection in the pool with metadata
 type connectionEntry struct {
-	conn          *grpc.ClientConn  // The actual gRPC connection
-	lastUsed      time.Time         // Timestamp of last usage for idle cleanup
-	inUse         bool              // Temporary flag to prevent concurrent usage
-	createdAt     time.Time         // When this connection was created
-	failureCount  int               // Number of consecutive failures
-	lastFailure   time.Time         // Time of last failure
-	healthChecked time.Time         // Last time health was checked
+	conn          *grpc.ClientConn // The actual gRPC connection
+	lastUsed      time.Time        // Timestamp of last usage for idle cleanup
+	createdAt     time.Time        // When this connection was created
+	failureCount  int              // Number of consecutive failures
+	lastFailure   time.Time        // Time of last failure
+	healthChecked time.Time        // Last time health was checked
+}
+
+// CircuitBreakerState represents the state of the circuit breaker
+type CircuitBreakerState int
+
+const (
+	CircuitBreakerClosed   CircuitBreakerState = iota // Normal operation
+	CircuitBreakerOpen                                // Failing, reject requests
+	CircuitBreakerHalfOpen                            // Testing if service recovered
+)
+
+// String returns the string representation of the circuit breaker state
+func (s CircuitBreakerState) String() string {
+	switch s {
+	case CircuitBreakerClosed:
+		return "closed"
+	case CircuitBreakerOpen:
+		return "open"
+	case CircuitBreakerHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}
+
+// CircuitBreaker implements the circuit breaker pattern for connection management
+type CircuitBreaker struct {
+	state       CircuitBreakerState
+	failures    int
+	lastFailure time.Time
+	nextAttempt time.Time
+	mu          sync.RWMutex
+
+	// Configuration
+	failureThreshold int           // Number of failures before opening circuit
+	resetTimeout     time.Duration // Time to wait before trying again
+	halfOpenMaxReqs  int           // Max requests allowed in half-open state
+	halfOpenCount    int           // Current requests in half-open state
+}
+
+// NewCircuitBreaker creates a new circuit breaker
+func NewCircuitBreaker(failureThreshold int, resetTimeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:            CircuitBreakerClosed,
+		failureThreshold: failureThreshold,
+		resetTimeout:     resetTimeout,
+		halfOpenMaxReqs:  3, // Allow 3 test requests in half-open state
+	}
+}
+
+// CanExecute checks if a request can be executed based on circuit breaker state
+func (cb *CircuitBreaker) CanExecute() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	switch cb.state {
+	case CircuitBreakerClosed:
+		return true
+	case CircuitBreakerOpen:
+		if time.Now().After(cb.nextAttempt) {
+			cb.mu.RUnlock()
+			cb.mu.Lock()
+			cb.state = CircuitBreakerHalfOpen
+			cb.halfOpenCount = 0
+			cb.mu.Unlock()
+			cb.mu.RLock()
+			return true
+		}
+		return false
+	case CircuitBreakerHalfOpen:
+		return cb.halfOpenCount < cb.halfOpenMaxReqs
+	default:
+		return false
+	}
+}
+
+// RecordSuccess records a successful request
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.state {
+	case CircuitBreakerHalfOpen:
+		cb.halfOpenCount++
+		if cb.halfOpenCount >= cb.halfOpenMaxReqs {
+			// Transition back to closed state
+			cb.state = CircuitBreakerClosed
+			cb.failures = 0
+			cb.lastFailure = time.Time{}
+		}
+	case CircuitBreakerClosed:
+		// Reset failure count on success
+		cb.failures = 0
+		cb.lastFailure = time.Time{}
+	}
+}
+
+// RecordFailure records a failed request
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failures++
+	cb.lastFailure = time.Now()
+
+	switch cb.state {
+	case CircuitBreakerHalfOpen:
+		// Half-open failure, go back to open
+		cb.state = CircuitBreakerOpen
+		cb.nextAttempt = time.Now().Add(cb.resetTimeout)
+	case CircuitBreakerClosed:
+		if cb.failures >= cb.failureThreshold {
+			cb.state = CircuitBreakerOpen
+			cb.nextAttempt = time.Now().Add(cb.resetTimeout)
+		}
+	}
+}
+
+// GetState returns the current state of the circuit breaker
+func (cb *CircuitBreaker) GetState() CircuitBreakerState {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.state
+}
+
+// GetStats returns circuit breaker statistics
+func (cb *CircuitBreaker) GetStats() map[string]interface{} {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	return map[string]interface{}{
+		"state":             cb.state.String(),
+		"failures":          cb.failures,
+		"last_failure":      cb.lastFailure.Format(time.RFC3339),
+		"next_attempt":      cb.nextAttempt.Format(time.RFC3339),
+		"half_open_count":   cb.halfOpenCount,
+		"failure_threshold": cb.failureThreshold,
+		"reset_timeout":     cb.resetTimeout.String(),
+	}
 }
 
 // ConnectionManager manages gRPC connections with proper lifecycle and pooling.
@@ -431,10 +769,12 @@ type connectionEntry struct {
 // - Automatic cleanup of idle connections
 // - Thread-safe access coordination
 // - Graceful shutdown without resource leaks
+// - Circuit breaker pattern integration
 type ConnectionManager struct {
-	pool   *ConnectionPool  // Underlying connection pool
-	mu     sync.RWMutex     // Protects manager state during shutdown
-	closed bool             // Indicates if manager is shut down
+	pool           *ConnectionPool // Underlying connection pool
+	circuitBreaker *CircuitBreaker // Circuit breaker for fault tolerance
+	mu             sync.RWMutex    // Protects manager state during shutdown
+	closed         bool            // Indicates if manager is shut down
 }
 
 // NewConnectionManager creates a new connection manager with pooling support
@@ -443,7 +783,26 @@ func NewConnectionManager(ctx context.Context, cfg *Config) (*ConnectionManager,
 		connections: make([]connectionEntry, 0, cfg.MaxConnectionPoolSize),
 		cfg:         cfg,
 	}
-	
+
+	// Create circuit breaker with configurable thresholds
+	circuitBreaker := NewCircuitBreaker(cfg.CircuitBreakerFailureThreshold, cfg.CircuitBreakerResetTimeout)
+	// Override half-open max from config
+	circuitBreaker.halfOpenMaxReqs = cfg.CircuitBreakerHalfOpenMax
+
+	// Startup warnings
+	if cfg.Logger != nil {
+		if cfg.BearerToken != "" {
+			cfg.Logger.Warnf("Using bearer_token over insecure transport. Avoid sending credentials without TLS.")
+		}
+		// warn on sensitive header keys
+		for k := range cfg.AuthHeaders {
+			kl := strings.ToLower(k)
+			if strings.Contains(kl, "password") || strings.Contains(kl, "secret") || strings.Contains(kl, "token") || strings.Contains(kl, "key") {
+				cfg.Logger.Warnf("Auth header key '%s' may contain sensitive data. Ensure secure transport.", k)
+			}
+		}
+	}
+
 	// Create initial connections
 	for i := 0; i < cfg.MaxConnectionPoolSize; i++ {
 		conn, err := createConnection(ctx, cfg)
@@ -452,26 +811,26 @@ func NewConnectionManager(ctx context.Context, cfg *Config) (*ConnectionManager,
 			pool.closeAllConnections()
 			return nil, fmt.Errorf("failed to create connection %d: %w", i, err)
 		}
-		
+
 		now := time.Now()
 		pool.connections = append(pool.connections, connectionEntry{
 			conn:          conn,
 			lastUsed:      now,
-			inUse:         false,
 			createdAt:     now,
 			failureCount:  0,
 			lastFailure:   time.Time{},
 			healthChecked: now,
 		})
 	}
-	
+
 	cm := &ConnectionManager{
-		pool: pool,
+		pool:           pool,
+		circuitBreaker: circuitBreaker,
 	}
-	
+
 	// Start connection cleanup goroutine
 	go cm.cleanupIdleConnections()
-	
+
 	return cm, nil
 }
 
@@ -481,12 +840,22 @@ func createConnection(ctx context.Context, cfg *Config) (*grpc.ClientConn, error
 	if err != nil {
 		return nil, fmt.Errorf("failed to build dial options: %w", err)
 	}
-	
-	conn, err := grpc.NewClient(cfg.Address, opts...)
+
+	// Ensure we block until connected (up to connect timeout) like grpcurl
+	opts = append(opts, grpc.WithBlock())
+
+	dialCtx := ctx
+	var cancel context.CancelFunc
+	if cfg.ConnectTimeout > 0 {
+		dialCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
+		defer cancel()
+	}
+
+	conn, err := grpc.DialContext(dialCtx, cfg.Address, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC client: %w", err)
 	}
-	
+
 	return conn, nil
 }
 
@@ -495,7 +864,7 @@ func isConnectionHealthy(conn *grpc.ClientConn) bool {
 	if conn == nil {
 		return false
 	}
-	
+
 	// Check connection state
 	state := conn.GetState()
 	switch state {
@@ -524,12 +893,12 @@ func isConnectionHealthyWithHistory(entry *connectionEntry, maxFailures int, fai
 	if entry == nil || entry.conn == nil {
 		return false
 	}
-	
+
 	// Check basic connection state first
 	if !isConnectionHealthy(entry.conn) {
 		return false
 	}
-	
+
 	// Consider failure history
 	if entry.failureCount >= maxFailures {
 		// Check if failures are within the failure window
@@ -539,17 +908,21 @@ func isConnectionHealthyWithHistory(entry *connectionEntry, maxFailures int, fai
 		// Reset failure count if outside the window
 		entry.failureCount = 0
 	}
-	
+
 	return true
 }
 
-// recordConnectionFailure records a failure for the connection entry
+// recordConnectionFailure records a failure for the connection entry with enhanced tracking
 func recordConnectionFailure(entry *connectionEntry) {
 	if entry == nil {
 		return
 	}
+
+	now := time.Now()
 	entry.failureCount++
-	entry.lastFailure = time.Now()
+	entry.lastFailure = now
+
+	// Logging handled at higher levels if needed
 }
 
 // recordConnectionSuccess resets failure count for successful connections
@@ -557,31 +930,71 @@ func recordConnectionSuccess(entry *connectionEntry) {
 	if entry == nil {
 		return
 	}
-	entry.failureCount = 0
-	entry.lastFailure = time.Time{}
+
+	// Only reset if we had failures before
+	if entry.failureCount > 0 {
+		// Log recovery for monitoring
+		// Logger not available in this scope
+		entry.failureCount = 0
+		entry.lastFailure = time.Time{}
+	}
+}
+
+// isConnectionExcessivelyFailing checks if a connection has failed too many times recently
+func isConnectionExcessivelyFailing(entry *connectionEntry, maxFailures int, failureWindow time.Duration) bool {
+	if entry == nil {
+		return true
+	}
+
+	// Check failure count threshold
+	if entry.failureCount >= maxFailures {
+		// Check if failures are within the failure window
+		if time.Since(entry.lastFailure) <= failureWindow {
+			return true
+		}
+		// Reset failure count if outside the window (connection has recovered)
+		entry.failureCount = 0
+		entry.lastFailure = time.Time{}
+	}
+
+	return false
 }
 
 // GetConnection returns an available gRPC connection from the pool (thread-safe)
 func (cm *ConnectionManager) GetConnection() (*grpc.ClientConn, error) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	
+
 	if cm.closed {
 		return nil, fmt.Errorf("connection manager is closed")
 	}
-	
-	return cm.pool.getConnection()
+
+	// Check circuit breaker before attempting to get connection
+	if !cm.circuitBreaker.CanExecute() {
+		return nil, fmt.Errorf("circuit breaker is open - service unavailable")
+	}
+
+	conn, err := cm.pool.getConnection()
+	if err != nil {
+		// Record failure in circuit breaker
+		cm.circuitBreaker.RecordFailure()
+		return nil, err
+	}
+
+	// Record success in circuit breaker
+	cm.circuitBreaker.RecordSuccess()
+	return conn, nil
 }
 
 // ValidateConnection checks if a specific connection is healthy and ready for use
 func (cm *ConnectionManager) ValidateConnection(conn *grpc.ClientConn) bool {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	
+
 	if cm.closed || conn == nil {
 		return false
 	}
-	
+
 	return isConnectionHealthy(conn)
 }
 
@@ -589,22 +1002,22 @@ func (cm *ConnectionManager) ValidateConnection(conn *grpc.ClientConn) bool {
 func (cm *ConnectionManager) GetConnectionStats() map[string]interface{} {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	
+
 	if cm.closed || cm.pool == nil {
 		return map[string]interface{}{
 			"status": "closed",
 		}
 	}
-	
+
 	cm.pool.mu.RLock()
 	defer cm.pool.mu.RUnlock()
-	
+
 	stats := map[string]interface{}{
 		"total_connections": len(cm.pool.connections),
-		"pool_size":        cap(cm.pool.connections),
-		"next_index":       cm.pool.nextIndex,
+		"pool_size":         cap(cm.pool.connections),
+		"next_index":        cm.pool.nextIndex,
 	}
-	
+
 	// Count connections by state and health metrics
 	stateCounts := make(map[string]int)
 	inUseCount := 0
@@ -613,26 +1026,22 @@ func (cm *ConnectionManager) GetConnectionStats() map[string]interface{} {
 	newestConnection := time.Time{}
 	totalFailures := 0
 	healthyConnections := 0
-	
+
 	for _, entry := range cm.pool.connections {
-		if entry.inUse {
-			inUseCount++
-		}
-		
 		if entry.conn != nil {
 			state := entry.conn.GetState()
 			stateCounts[state.String()]++
-			
+
 			// Health metrics
 			if isConnectionHealthy(entry.conn) {
 				healthyConnections++
 			}
-			
+
 			if entry.failureCount > 0 {
 				failedConnections++
 				totalFailures += entry.failureCount
 			}
-			
+
 			// Age tracking
 			if entry.createdAt.Before(oldestConnection) {
 				oldestConnection = entry.createdAt
@@ -642,21 +1051,27 @@ func (cm *ConnectionManager) GetConnectionStats() map[string]interface{} {
 			}
 		}
 	}
-	
+
 	stats["in_use_connections"] = inUseCount
 	stats["available_connections"] = len(cm.pool.connections) - inUseCount
 	stats["healthy_connections"] = healthyConnections
 	stats["failed_connections"] = failedConnections
 	stats["total_failures"] = totalFailures
 	stats["connection_states"] = stateCounts
-	
+
 	if !oldestConnection.IsZero() {
 		stats["oldest_connection_age"] = time.Since(oldestConnection).String()
 	}
 	if !newestConnection.IsZero() {
 		stats["newest_connection_age"] = time.Since(newestConnection).String()
 	}
-	
+
+	// Add circuit breaker statistics
+	if cm.circuitBreaker != nil {
+		cbStats := cm.circuitBreaker.GetStats()
+		stats["circuit_breaker"] = cbStats
+	}
+
 	return stats
 }
 
@@ -664,21 +1079,21 @@ func (cm *ConnectionManager) GetConnectionStats() map[string]interface{} {
 func (cp *ConnectionPool) getConnection() (*grpc.ClientConn, error) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
-	
+
 	if cp.closed {
 		return nil, fmt.Errorf("connection pool is closed")
 	}
-	
-	// Find an available connection using round-robin with enhanced health validation
+
+	// First pass: Try to find a healthy connection in round-robin order
 	for i := 0; i < len(cp.connections); i++ {
 		idx := (cp.nextIndex + i) % len(cp.connections)
 		entry := &cp.connections[idx]
-		
-		if !entry.inUse {
-			// Validate connection health with failure history
-			if !isConnectionHealthyWithHistory(entry, defaultMaxConnectionFailures, defaultFailureWindow) {
+
+		if !isConnectionExcessivelyFailing(entry, defaultMaxConnectionFailures, defaultFailureWindow) {
+			// Validate connection health
+			if !isConnectionHealthy(entry.conn) {
 				recordConnectionFailure(entry)
-				// Replace unhealthy connection
+				// Try to replace unhealthy connection
 				if newConn, err := createConnection(context.Background(), cp.cfg); err == nil {
 					entry.conn.Close()
 					now := time.Now()
@@ -693,60 +1108,81 @@ func (cp *ConnectionPool) getConnection() (*grpc.ClientConn, error) {
 					continue
 				}
 			}
-			
-			entry.inUse = true
+
 			entry.lastUsed = time.Now()
 			entry.healthChecked = time.Now()
 			cp.nextIndex = (idx + 1) % len(cp.connections)
-			
+
 			// Record successful connection usage
 			recordConnectionSuccess(entry)
-			
-			// Start a goroutine to release the connection after a short time
-			go func(e *connectionEntry) {
-				time.Sleep(defaultConnectionReleaseDelay) // Small delay to allow operation completion
-				cp.mu.Lock()
-				e.inUse = false
-				cp.mu.Unlock()
-			}(entry)
-			
+
 			return entry.conn, nil
 		}
 	}
-	
-	// If all connections are in use, return the least recently used one after validation
-	// (this allows connection sharing in high-load scenarios)
-	oldestIdx := 0
-	oldestTime := cp.connections[0].lastUsed
-	
+
+	// Second pass: Find the best available connection (prioritize by failure rate)
+	var bestEntry *connectionEntry
+	var bestScore int = -1
+
 	for i, entry := range cp.connections {
-		if entry.lastUsed.Before(oldestTime) {
-			oldestTime = entry.lastUsed
-			oldestIdx = i
+		// Calculate connection score (lower is better)
+		score := entry.failureCount
+
+		// Boost score for recently failed connections (within last minute)
+		if time.Since(entry.lastFailure) < time.Minute {
+			score += 10
+		}
+
+		// Prefer connections that haven't been used recently (for load balancing)
+		if time.Since(entry.lastUsed) > time.Minute {
+			score -= 5
+		}
+
+		if bestEntry == nil || score < bestScore {
+			bestEntry = &cp.connections[i]
+			bestScore = score
 		}
 	}
-	
-	// Validate the oldest connection before returning it
-	entry := &cp.connections[oldestIdx]
-	if !isConnectionHealthy(entry.conn) {
-		// Replace unhealthy connection
-		if newConn, err := createConnection(context.Background(), cp.cfg); err == nil {
-			entry.conn.Close()
-			entry.conn = newConn
+
+	if bestEntry != nil {
+		// Validate the best connection before returning it
+		if !isConnectionHealthy(bestEntry.conn) {
+			recordConnectionFailure(bestEntry)
+			// Try to replace unhealthy connection
+			if newConn, err := createConnection(context.Background(), cp.cfg); err == nil {
+				bestEntry.conn.Close()
+				now := time.Now()
+				bestEntry.conn = newConn
+				bestEntry.lastUsed = now
+				bestEntry.createdAt = now
+				bestEntry.failureCount = 0
+				bestEntry.lastFailure = time.Time{}
+				bestEntry.healthChecked = now
+			}
+			// Continue using the connection even if replacement failed
 		}
-		// Continue using the connection even if replacement failed
-		// (better to try than to fail completely)
+
+		bestEntry.lastUsed = time.Now()
+		bestEntry.healthChecked = time.Now()
+
+		// Record successful connection usage
+		recordConnectionSuccess(bestEntry)
+
+		return bestEntry.conn, nil
 	}
-	
-	entry.lastUsed = time.Now()
-	return entry.conn, nil
+
+	return nil, fmt.Errorf("no connections available in pool")
 }
 
 // cleanupIdleConnections periodically cleans up idle connections
 func (cm *ConnectionManager) cleanupIdleConnections() {
-	ticker := time.NewTicker(defaultCleanupTickerInterval)
+	interval := defaultCleanupTickerInterval
+	if cm.pool != nil && cm.pool.cfg != nil && cm.pool.cfg.ConnectionCleanupInterval > 0 {
+		interval = cm.pool.cfg.ConnectionCleanupInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
@@ -756,7 +1192,7 @@ func (cm *ConnectionManager) cleanupIdleConnections() {
 				return
 			}
 			cm.mu.RUnlock()
-			
+
 			cm.pool.cleanupIdle()
 		}
 	}
@@ -766,28 +1202,35 @@ func (cm *ConnectionManager) cleanupIdleConnections() {
 func (cp *ConnectionPool) cleanupIdle() {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
-	
+
 	if cp.closed {
 		return
 	}
-	
+
 	now := time.Now()
+	replacedCount := 0
+	failedCleanupCount := 0
+
 	for i := range cp.connections {
 		entry := &cp.connections[i]
 		shouldReplace := false
-		
+
 		// Check for idle timeout
-		if !entry.inUse && now.Sub(entry.lastUsed) > cp.cfg.ConnectionIdleTimeout {
+		if now.Sub(entry.lastUsed) > cp.cfg.ConnectionIdleTimeout {
 			shouldReplace = true
 		}
-		
-		// Check connection health with failure history (even if not idle)
-		if !entry.inUse && !isConnectionHealthyWithHistory(entry, defaultMaxConnectionFailures, defaultFailureWindow) {
+
+		// Check for excessive failures
+		if isConnectionExcessivelyFailing(entry, defaultMaxConnectionFailures, defaultFailureWindow) {
 			shouldReplace = true
 		}
-		
+
 		// Perform periodic health checks
-		if !entry.inUse && now.Sub(entry.healthChecked) > defaultHealthCheckInterval {
+		interval := cp.cfg.ConnectionHealthcheckInterval
+		if interval <= 0 {
+			interval = defaultHealthCheckInterval
+		}
+		if now.Sub(entry.healthChecked) > interval {
 			if !isConnectionHealthy(entry.conn) {
 				recordConnectionFailure(entry)
 				shouldReplace = true
@@ -796,15 +1239,18 @@ func (cp *ConnectionPool) cleanupIdle() {
 				recordConnectionSuccess(entry)
 			}
 		}
-		
+
 		// Check for connections that are too old
-		if !entry.inUse && cp.cfg.SessionMaxLifetime > 0 && now.Sub(entry.createdAt) > cp.cfg.SessionMaxLifetime {
+		if cp.cfg.ConnectionMaxLifetime > 0 && now.Sub(entry.createdAt) > cp.cfg.ConnectionMaxLifetime {
 			shouldReplace = true
 		}
-		
+
 		if shouldReplace {
 			// Close the connection and create a new one
-			entry.conn.Close()
+			if entry.conn != nil {
+				entry.conn.Close()
+			}
+
 			if newConn, err := createConnection(context.Background(), cp.cfg); err == nil {
 				entry.conn = newConn
 				entry.lastUsed = now
@@ -812,11 +1258,17 @@ func (cp *ConnectionPool) cleanupIdle() {
 				entry.failureCount = 0
 				entry.lastFailure = time.Time{}
 				entry.healthChecked = now
+				replacedCount++
+
+				// Replacement succeeded
+			} else {
+				failedCleanupCount++
+				// Keep old connection; next health check will try again
 			}
-			// If replacement fails, keep the old connection for now
-			// The next health check will try again
 		}
 	}
+
+	// Optional: surface metrics via stats instead of logs
 }
 
 // closeAllConnections closes all connections in the pool
@@ -832,50 +1284,86 @@ func (cp *ConnectionPool) closeAllConnections() {
 func (cm *ConnectionManager) Close() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	
+
 	if cm.closed {
 		return nil
 	}
-	
+
 	cm.closed = true
-	
+
 	if cm.pool != nil {
 		cm.pool.mu.Lock()
 		cm.pool.closed = true
 		cm.pool.closeAllConnections()
 		cm.pool.mu.Unlock()
 	}
-	
+
 	return nil
+}
+
+// GetCircuitBreakerState returns the current state of the circuit breaker
+func (cm *ConnectionManager) GetCircuitBreakerState() CircuitBreakerState {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	if cm.closed || cm.circuitBreaker == nil {
+		return CircuitBreakerClosed
+	}
+
+	return cm.circuitBreaker.GetState()
+}
+
+// RecordConnectionSuccess records a successful connection usage for circuit breaker
+func (cm *ConnectionManager) RecordConnectionSuccess() {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	if cm.closed || cm.circuitBreaker == nil {
+		return
+	}
+
+	cm.circuitBreaker.RecordSuccess()
+}
+
+// RecordConnectionFailure records a connection failure for circuit breaker
+func (cm *ConnectionManager) RecordConnectionFailure() {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	if cm.closed || cm.circuitBreaker == nil {
+		return
+	}
+
+	cm.circuitBreaker.RecordFailure()
 }
 
 // buildDialOptions creates gRPC dial options from configuration with enhanced security and performance
 func buildDialOptions(ctx context.Context, cfg *Config) ([]grpc.DialOption, error) {
 	var opts []grpc.DialOption
-	
-	// Enhanced TLS configuration
+
+	// TLS disabled: always use insecure transport credentials
 	transportCreds, err := buildTransportCredentials(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build transport credentials: %w", err)
 	}
 	opts = append(opts, grpc.WithTransportCredentials(transportCreds))
-	
+
 	// Authority
 	if cfg.Authority != "" {
 		opts = append(opts, grpc.WithAuthority(cfg.Authority))
 	}
-	
+
 	// User agent
 	if cfg.UserAgent != "" {
 		opts = append(opts, grpc.WithUserAgent(cfg.UserAgent))
 	}
-	
+
 	// Enhanced load balancing with retry policy
 	serviceConfig := buildServiceConfig(cfg)
 	if serviceConfig != "" {
 		opts = append(opts, grpc.WithDefaultServiceConfig(serviceConfig))
 	}
-	
+
 	// Keep alive parameters
 	if cfg.KeepAliveTime > 0 || cfg.KeepAliveTimeout > 0 || cfg.KeepAlivePermit {
 		opts = append(opts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -884,23 +1372,22 @@ func buildDialOptions(ctx context.Context, cfg *Config) ([]grpc.DialOption, erro
 			PermitWithoutStream: cfg.KeepAlivePermit,
 		}))
 	}
-	
+
 	// Default call options including message size limits
 	callOpts := buildDefaultCallOptions(cfg)
 	if len(callOpts) > 0 {
 		opts = append(opts, grpc.WithDefaultCallOptions(callOpts...))
 	}
-	
+
 	// Authentication credentials
 	if cfg.BearerToken != "" || len(cfg.AuthHeaders) > 0 {
 		opts = append(opts, grpc.WithPerRPCCredentials(headerCreds{
-			token:               cfg.BearerToken,
-			headers:             cfg.AuthHeaders,
-			tlsEnabled:          cfg.TLSEnabled,
-			requireTransportSec: cfg.RequireTransportSecurity,
+			token:      cfg.BearerToken,
+			headers:    cfg.AuthHeaders,
+			tlsEnabled: false,
 		}))
 	}
-	
+
 	// Interceptors for observability and best practices
 	if cfg.EnableInterceptors {
 		unaryInterceptors, streamInterceptors := buildInterceptors(cfg)
@@ -911,79 +1398,13 @@ func buildDialOptions(ctx context.Context, cfg *Config) ([]grpc.DialOption, erro
 			opts = append(opts, grpc.WithChainStreamInterceptor(streamInterceptors...))
 		}
 	}
-	
+
 	return opts, nil
 }
 
-// buildTransportCredentials creates enhanced TLS credentials with proper validation
+// buildTransportCredentials returns insecure credentials (TLS disabled)
 func buildTransportCredentials(cfg *Config) (credentials.TransportCredentials, error) {
-	if !cfg.TLSEnabled {
-		return insecure.NewCredentials(), nil
-	}
-	
-	tlsConfig := cfg.TLSConfig
-	if tlsConfig == nil {
-		tlsConfig = &tls.Config{}
-	}
-	
-	// Set minimum TLS version
-	if tlsConfig.MinVersion == 0 {
-		tlsConfig.MinVersion = tls.VersionTLS12
-	}
-	
-	// Configure server name
-	if cfg.TLSServerName != "" {
-		tlsConfig.ServerName = cfg.TLSServerName
-	} else if cfg.Authority != "" && tlsConfig.ServerName == "" {
-		host, _, err := net.SplitHostPort(cfg.Authority)
-		if err != nil {
-			host = cfg.Authority
-		}
-		tlsConfig.ServerName = host
-	}
-	
-	// Configure certificate verification
-	tlsConfig.InsecureSkipVerify = cfg.TLSSkipVerify
-	
-	// Load custom CA certificate (supports both file path and inline cert data)
-	if cfg.TLSCACert != "" {
-		caCertPool := x509.NewCertPool()
-		var caCertData []byte
-		
-		// Try to load as file first, then treat as inline cert data
-		if certData, err := os.ReadFile(cfg.TLSCACert); err == nil {
-			caCertData = certData
-		} else {
-			// Assume it's inline cert data
-			caCertData = []byte(cfg.TLSCACert)
-		}
-		
-		if !caCertPool.AppendCertsFromPEM(caCertData) {
-			return nil, fmt.Errorf("failed to parse CA certificate")
-		}
-		tlsConfig.RootCAs = caCertPool
-	}
-	
-	// Configure mutual TLS (supports both file path and inline cert/key data)
-	if cfg.TLSClientCert != "" && cfg.TLSClientKey != "" {
-		var cert tls.Certificate
-		var err error
-		
-		// Try to load from files first
-		if _, fileErr := os.Stat(cfg.TLSClientCert); fileErr == nil {
-			cert, err = tls.LoadX509KeyPair(cfg.TLSClientCert, cfg.TLSClientKey)
-		} else {
-			// Treat as inline cert/key data
-			cert, err = tls.X509KeyPair([]byte(cfg.TLSClientCert), []byte(cfg.TLSClientKey))
-		}
-		
-		if err != nil {
-			return nil, fmt.Errorf("failed to load client certificate: %w", err)
-		}
-		tlsConfig.Certificates = []tls.Certificate{cert}
-	}
-	
-	return credentials.NewTLS(tlsConfig), nil
+	return insecure.NewCredentials(), nil
 }
 
 // buildServiceConfig creates a gRPC service config with load balancing and retry policies using proper JSON marshaling
@@ -991,31 +1412,31 @@ func buildServiceConfig(cfg *Config) string {
 	if cfg.LoadBalancingPolicy == "" {
 		return ""
 	}
-	
+
 	serviceConfig := ServiceConfig{}
-	
+
 	// Load balancing policy
 	if cfg.LoadBalancingPolicy != "" {
 		serviceConfig.LoadBalancingPolicy = cfg.LoadBalancingPolicy
 	}
-	
+
 	// Note: Retry policy is handled via interceptors instead of service config
 	// to avoid complex JSON marshaling issues with gRPC status codes
-	
+
 	// Marshal to JSON with proper error handling
 	jsonBytes, err := json.Marshal(serviceConfig)
 	if err != nil {
 		// Log error and return empty config - this shouldn't happen with valid config
 		return ""
 	}
-	
+
 	return string(jsonBytes)
 }
 
 // buildDefaultCallOptions creates default call options including performance optimizations
 func buildDefaultCallOptions(cfg *Config) []grpc.CallOption {
 	var callOpts []grpc.CallOption
-	
+
 	// Message size limits
 	if cfg.MaxSendMsgBytes > 0 {
 		callOpts = append(callOpts, grpc.MaxCallSendMsgSize(cfg.MaxSendMsgBytes))
@@ -1023,10 +1444,12 @@ func buildDefaultCallOptions(cfg *Config) []grpc.CallOption {
 	if cfg.MaxRecvMsgBytes > 0 {
 		callOpts = append(callOpts, grpc.MaxCallRecvMsgSize(cfg.MaxRecvMsgBytes))
 	}
-	
-	// Note: Default metadata is now handled in context via injectMetadataIntoContext()
-	// This avoids duplication and ensures proper metadata handling
-	
+
+	// Compression
+	if cfg.Compression != "" {
+		callOpts = append(callOpts, grpc.UseCompressor(cfg.Compression))
+	}
+
 	return callOpts
 }
 
@@ -1057,28 +1480,65 @@ func formatDurationForServiceConfig(d time.Duration) string {
 func buildInterceptors(cfg *Config) ([]grpc.UnaryClientInterceptor, []grpc.StreamClientInterceptor) {
 	var unaryInterceptors []grpc.UnaryClientInterceptor
 	var streamInterceptors []grpc.StreamClientInterceptor
-	
+
 	// Deadline propagation interceptor
 	if cfg.PropagateDeadlines {
 		unaryInterceptors = append(unaryInterceptors, deadlineUnaryInterceptor)
 		streamInterceptors = append(streamInterceptors, deadlineStreamInterceptor)
 	}
-	
-	// Metadata propagation interceptor
-	if len(cfg.DefaultMetadata) > 0 {
-		unaryInterceptors = append(unaryInterceptors, metadataUnaryInterceptor(cfg.DefaultMetadata))
-		streamInterceptors = append(streamInterceptors, metadataStreamInterceptor(cfg.DefaultMetadata))
+
+	// Metadata propagation interceptor (include binary metadata)
+	if len(cfg.DefaultMetadata) > 0 || len(cfg.DefaultMetadataBin) > 0 {
+		unaryInterceptors = append(unaryInterceptors, metadataUnaryInterceptor(cfg.DefaultMetadata, cfg.DefaultMetadataBin))
+		streamInterceptors = append(streamInterceptors, metadataStreamInterceptor(cfg.DefaultMetadata, cfg.DefaultMetadataBin))
 	}
-	
-	// Logging/observability interceptor
-	unaryInterceptors = append(unaryInterceptors, loggingUnaryInterceptor)
-	streamInterceptors = append(streamInterceptors, loggingStreamInterceptor)
-	
+
+	// Logging/observability interceptor (capture logger)
+	if cfg.Logger != nil {
+		log := cfg.Logger
+		unaryInterceptors = append(unaryInterceptors, func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+			start := time.Now()
+			err := invoker(ctx, method, req, reply, cc, opts...)
+			dur := time.Since(start)
+			st, _ := status.FromError(err)
+			if err != nil {
+				logAtLevel(log, cfg.LogLevelError, "grpc unary call failed", method, st.Code().String(), dur)
+				if cfg.Observer != nil {
+					cfg.Observer.RecordCall(err)
+				}
+			} else {
+				logAtLevel(log, cfg.LogLevelSuccess, "grpc unary call ok", method, "OK", dur)
+				if cfg.Observer != nil {
+					cfg.Observer.RecordCall(nil)
+				}
+			}
+			return err
+		})
+		streamInterceptors = append(streamInterceptors, func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			start := time.Now()
+			cs, err := streamer(ctx, desc, cc, method, opts...)
+			dur := time.Since(start)
+			st, _ := status.FromError(err)
+			if err != nil {
+				logAtLevel(log, cfg.LogLevelError, "grpc stream open failed", method, st.Code().String(), dur)
+				if cfg.Observer != nil {
+					cfg.Observer.RecordCall(err)
+				}
+			} else {
+				logAtLevel(log, cfg.LogLevelSuccess, "grpc stream opened", method, "OK", dur)
+				if cfg.Observer != nil {
+					cfg.Observer.RecordCall(nil)
+				}
+			}
+			return cs, err
+		})
+	}
+
 	// Retry interceptor (if not handled by service config)
 	if cfg.RetryPolicy != nil {
 		unaryInterceptors = append(unaryInterceptors, retryUnaryInterceptor(cfg.RetryPolicy))
 	}
-	
+
 	return unaryInterceptors, streamInterceptors
 }
 
@@ -1086,7 +1546,7 @@ func buildInterceptors(cfg *Config) ([]grpc.UnaryClientInterceptor, []grpc.Strea
 func deadlineUnaryInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 	// Enhanced context deadline handling
 	ctx = enhanceContextWithDeadlines(ctx)
-	
+
 	// Add method-specific timeout if none exists
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		// Apply default timeout for unary calls
@@ -1095,11 +1555,11 @@ func deadlineUnaryInterceptor(ctx context.Context, method string, req, reply int
 		defer cancel()
 		ctx = newCtx
 	}
-	
+
 	// Ensure context is properly canceled on completion
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	
+
 	return invoker(ctx, method, req, reply, cc, opts...)
 }
 
@@ -1107,7 +1567,7 @@ func deadlineUnaryInterceptor(ctx context.Context, method string, req, reply int
 func deadlineStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	// Enhanced context deadline handling for streams
 	ctx = enhanceContextWithDeadlines(ctx)
-	
+
 	// Add method-specific timeout for streaming calls if none exists
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		// Apply longer default timeout for streaming calls
@@ -1116,7 +1576,7 @@ func deadlineStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *g
 		defer cancel()
 		ctx = newCtx
 	}
-	
+
 	return streamer(ctx, desc, cc, method, opts...)
 }
 
@@ -1126,108 +1586,67 @@ func enhanceContextWithDeadlines(ctx context.Context) context.Context {
 	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
 		// Calculate remaining time
 		remaining := time.Until(deadline)
-		
+
 		// If deadline is too close, extend it slightly to avoid immediate failures
 		minRemainingTime := 100 * time.Millisecond
 		if remaining < minRemainingTime {
-			newCtx, cancel := context.WithTimeout(context.Background(), minRemainingTime)
-			// Copy values from original context
-			if val := ctx.Value("metadata"); val != nil {
-				newCtx = context.WithValue(newCtx, "metadata", val)
-			}
-			_ = cancel // Keep cancel function available but don't defer it here
+			newCtx, cancel := context.WithTimeout(ctx, minRemainingTime)
+			_ = cancel
 			return newCtx
 		}
-		
+
 		// Deadline is reasonable, use as-is
 		return ctx
 	}
-	
+
 	// No deadline exists, return original context
 	return ctx
 }
 
-// withContextMetadata adds metadata from one context to another while preserving deadlines
-func withContextMetadata(targetCtx, sourceCtx context.Context) context.Context {
-	// Copy important metadata values
-	metadataKeys := []interface{}{
-		"session_id", "trace_id", "request_id", "user_id", "correlation_id",
-	}
-	
-	result := targetCtx
-	for _, key := range metadataKeys {
-		if val := sourceCtx.Value(key); val != nil {
-			result = context.WithValue(result, key, val)
-		}
-	}
-	
-	return result
-}
-
 // metadataUnaryInterceptor adds default metadata to unary calls
-func metadataUnaryInterceptor(defaultMD map[string]string) grpc.UnaryClientInterceptor {
+func metadataUnaryInterceptor(defaultMD map[string]string, defaultBin map[string]string) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		// Add default metadata to context
 		md := metadata.New(defaultMD)
-		
-		// Merge with existing metadata if present
+		// Decode base64 values for -bin keys like grpcurl
+		for k, v := range defaultBin {
+			decoded, err := base64.StdEncoding.DecodeString(v)
+			if err != nil {
+				// fall back to raw string if decode fails
+				md[k] = append(md[k], v)
+				continue
+			}
+			md[k] = append(md[k], string(decoded))
+		}
 		if existingMD, ok := metadata.FromOutgoingContext(ctx); ok {
 			for k, v := range existingMD {
-				md[k] = v
+				md[k] = append(md[k], v...)
 			}
 		}
-		
 		ctx = metadata.NewOutgoingContext(ctx, md)
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
 }
 
 // metadataStreamInterceptor adds default metadata to streaming calls
-func metadataStreamInterceptor(defaultMD map[string]string) grpc.StreamClientInterceptor {
+func metadataStreamInterceptor(defaultMD map[string]string, defaultBin map[string]string) grpc.StreamClientInterceptor {
 	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-		// Add default metadata to context
 		md := metadata.New(defaultMD)
-		
-		// Merge with existing metadata if present
+		for k, v := range defaultBin {
+			decoded, err := base64.StdEncoding.DecodeString(v)
+			if err != nil {
+				md[k] = append(md[k], v)
+				continue
+			}
+			md[k] = append(md[k], string(decoded))
+		}
 		if existingMD, ok := metadata.FromOutgoingContext(ctx); ok {
 			for k, v := range existingMD {
-				md[k] = v
+				md[k] = append(md[k], v...)
 			}
 		}
-		
 		ctx = metadata.NewOutgoingContext(ctx, md)
 		return streamer(ctx, desc, cc, method, opts...)
 	}
-}
-
-// loggingUnaryInterceptor provides basic logging for observability
-func loggingUnaryInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-	start := time.Now()
-	err := invoker(ctx, method, req, reply, cc, opts...)
-	duration := time.Since(start)
-	
-	// Log the call (in production, use structured logging)
-	if err != nil {
-		// Log error with context
-		_ = duration // Use duration for metrics
-	}
-	
-	return err
-}
-
-// loggingStreamInterceptor provides basic logging for streaming calls
-func loggingStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	start := time.Now()
-	stream, err := streamer(ctx, desc, cc, method, opts...)
-	duration := time.Since(start)
-	
-	// Log the stream creation (in production, use structured logging)
-	if err != nil {
-		// Log error with context
-		_ = duration // Use duration for metrics
-	}
-	
-	return stream, err
 }
 
 // retryUnaryInterceptor implements client-side retry logic
@@ -1235,7 +1654,7 @@ func retryUnaryInterceptor(retryPolicy *RetryPolicy) grpc.UnaryClientInterceptor
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		var lastErr error
 		backoff := retryPolicy.InitialBackoff
-		
+
 		for attempt := 0; attempt < retryPolicy.MaxAttempts; attempt++ {
 			// Check for context cancellation
 			select {
@@ -1243,24 +1662,24 @@ func retryUnaryInterceptor(retryPolicy *RetryPolicy) grpc.UnaryClientInterceptor
 				return ctx.Err()
 			default:
 			}
-			
+
 			err := invoker(ctx, method, req, reply, cc, opts...)
 			if err == nil {
 				return nil // Success
 			}
-			
+
 			lastErr = err
-			
+
 			// Check if error is retryable
 			if !isRetryableError(err, retryPolicy.RetryableStatusCodes) {
 				return err
 			}
-			
+
 			// Don't retry on last attempt
 			if attempt == retryPolicy.MaxAttempts-1 {
 				break
 			}
-			
+
 			// Sleep with backoff
 			select {
 			case <-time.After(backoff):
@@ -1272,7 +1691,7 @@ func retryUnaryInterceptor(retryPolicy *RetryPolicy) grpc.UnaryClientInterceptor
 				return ctx.Err()
 			}
 		}
-		
+
 		return lastErr
 	}
 }
@@ -1282,18 +1701,18 @@ func isRetryableError(err error, retryableCodes []codes.Code) bool {
 	if err == nil {
 		return false
 	}
-	
+
 	st, ok := status.FromError(err)
 	if !ok {
 		return false
 	}
-	
+
 	for _, code := range retryableCodes {
 		if st.Code() == code {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -1331,14 +1750,14 @@ func (mp *MessagePool) Put(msg *dynamic.Message) {
 
 // MethodResolver handles method resolution with caching and performance optimizations
 type MethodResolver struct {
-	cache       sync.Map // string -> *methodCacheEntry
+	cache        sync.Map // string -> *methodCacheEntry
 	messagePools sync.Map // string -> *MessagePool
 }
 
 // methodCacheEntry holds both the method descriptor and message pools
 type methodCacheEntry struct {
-	method    *desc.MethodDescriptor
-	inputPool *MessagePool
+	method     *desc.MethodDescriptor
+	inputPool  *MessagePool
 	outputPool *MessagePool
 }
 
@@ -1350,39 +1769,40 @@ func NewMethodResolver() *MethodResolver {
 // ResolveMethod resolves a method using reflection or proto files with enhanced caching
 func (mr *MethodResolver) ResolveMethod(ctx context.Context, conn *grpc.ClientConn, cfg *Config) (*desc.MethodDescriptor, error) {
 	// Check cache first
-	if cached, ok := mr.cache.Load(cfg.Method); ok {
+	key := mr.cacheKey(cfg)
+	if cached, ok := mr.cache.Load(key); ok {
 		entry := cached.(*methodCacheEntry)
 		return entry.method, nil
 	}
-	
+
 	var method *desc.MethodDescriptor
 	var err error
-	
+
 	if len(cfg.ProtoFiles) > 0 {
 		method, err = mr.resolveFromProtoFiles(cfg.Method, cfg.ProtoFiles, cfg.IncludePaths)
 	} else {
 		method, err = mr.resolveFromReflection(ctx, conn, cfg.Method)
 	}
-	
+
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Create message pools for performance optimization
 	var inputPool, outputPool *MessagePool
 	if cfg.EnableMessagePool {
 		inputPool = NewMessagePool(method.GetInputType())
 		outputPool = NewMessagePool(method.GetOutputType())
 	}
-	
+
 	// Cache the result with message pools
 	entry := &methodCacheEntry{
 		method:     method,
 		inputPool:  inputPool,
 		outputPool: outputPool,
 	}
-	mr.cache.Store(cfg.Method, entry)
-	
+	mr.cache.Store(key, entry)
+
 	return method, nil
 }
 
@@ -1399,22 +1819,22 @@ func (mr *MethodResolver) GetMessagePools(methodName string) (*MessagePool, *Mes
 func (mr *MethodResolver) resolveFromReflection(ctx context.Context, conn *grpc.ClientConn, methodName string) (*desc.MethodDescriptor, error) {
 	rc := grpcreflect.NewClientAuto(ctx, conn)
 	defer rc.Reset()
-	
+
 	svcName, mName, err := parseMethodName(methodName)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	svc, err := rc.ResolveService(svcName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve service %s: %w", svcName, err)
 	}
-	
+
 	method := svc.FindMethodByName(mName)
 	if method == nil {
 		return nil, fmt.Errorf("method not found: %s", methodName)
 	}
-	
+
 	return method, nil
 }
 
@@ -1424,17 +1844,17 @@ func (mr *MethodResolver) resolveFromProtoFiles(methodName string, protoFiles, i
 	if len(includePaths) > 0 {
 		parser.ImportPaths = includePaths
 	}
-	
+
 	fds, err := parser.ParseFiles(protoFiles...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse proto files: %w", err)
 	}
-	
+
 	svcName, mName, err := parseMethodName(methodName)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	for _, fd := range fds {
 		for _, svc := range fd.GetServices() {
 			if svc.GetFullyQualifiedName() == svcName || svc.GetName() == svcName {
@@ -1444,7 +1864,7 @@ func (mr *MethodResolver) resolveFromProtoFiles(methodName string, protoFiles, i
 			}
 		}
 	}
-	
+
 	return nil, fmt.Errorf("method not found in provided proto files: %s", methodName)
 }
 
@@ -1455,13 +1875,13 @@ func parseMethodName(full string) (string, string, error) {
 	if len(full) < minMethodNameLength { // Minimum: "/a/b"
 		return "", "", fmt.Errorf("invalid method format: %s (too short)", full)
 	}
-	
+
 	// Remove leading slash efficiently
 	start := 0
 	if full[0] == '/' {
 		start = 1
 	}
-	
+
 	// Find the last slash to separate service and method (single pass)
 	lastSlash := -1
 	for i := len(full) - 1; i >= start; i-- {
@@ -1470,19 +1890,19 @@ func parseMethodName(full string) (string, string, error) {
 			break
 		}
 	}
-	
+
 	if lastSlash == -1 || lastSlash == start {
 		return "", "", fmt.Errorf("invalid method format: %s (expected format: /service/method)", full)
 	}
-	
+
 	serviceName := full[start:lastSlash]
 	methodName := full[lastSlash+1:]
-	
+
 	// Validate non-empty (avoid string comparison)
 	if len(serviceName) == 0 || len(methodName) == 0 {
 		return "", "", fmt.Errorf("invalid method format: %s (service and method names cannot be empty)", full)
 	}
-	
+
 	return serviceName, methodName, nil
 }
 
@@ -1508,6 +1928,7 @@ func DefaultRetryConfig() RetryConfig {
 // - Implements exponential backoff with configurable initial delay and multiplier
 // - Respects maximum backoff duration to prevent excessive wait times
 // - Honors context cancellation at any point during retry attempts
+// - Uses intelligent error classification for retry decisions
 //
 // Context Handling:
 // - Checks for context cancellation before each retry attempt
@@ -1518,6 +1939,7 @@ func DefaultRetryConfig() RetryConfig {
 // - Returns immediately on successful operation (nil error)
 // - Accumulates the last error from failed attempts
 // - Provides comprehensive error context including attempt count
+// - Uses error classification to determine retry eligibility
 //
 // Usage Pattern:
 // This is typically used for transient failures in gRPC operations where
@@ -1525,7 +1947,7 @@ func DefaultRetryConfig() RetryConfig {
 func WithContextRetry(ctx context.Context, cfg RetryConfig, operation func() error) error {
 	var lastErr error
 	backoff := cfg.InitialBackoff
-	
+
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
 		// Check context cancellation before each attempt
 		select {
@@ -1536,20 +1958,33 @@ func WithContextRetry(ctx context.Context, cfg RetryConfig, operation func() err
 			return ctx.Err()
 		default:
 		}
-		
+
 		if err := operation(); err != nil {
 			lastErr = err
-			
+
+			// Use error classification to determine if we should retry
+			classifiedErr := classifyGrpcError("", err)
+			if classifiedErr != nil && !classifiedErr.IsRetryable() {
+				// Don't retry non-retryable errors
+				return fmt.Errorf("non-retryable error on attempt %d: %w", attempt+1, err)
+			}
+
 			// Don't sleep after the last attempt
 			if attempt == cfg.MaxRetries {
 				break
 			}
-			
+
 			// Sleep with backoff, but respect context cancellation
 			select {
 			case <-time.After(backoff):
-				// Exponential backoff
-				backoff *= 2
+				// Exponential backoff with jitter
+				backoff = time.Duration(float64(backoff) * defaultRetryMultiplier)
+
+				// Add small jitter to prevent thundering herd (±10%)
+				jitterFactor := 0.1 * (2*rand.Float64() - 1) // Random value between -0.1 and 0.1
+				jitter := time.Duration(float64(backoff) * jitterFactor)
+				backoff += jitter
+
 				if backoff > cfg.MaxBackoff {
 					backoff = cfg.MaxBackoff
 				}
@@ -1560,6 +1995,232 @@ func WithContextRetry(ctx context.Context, cfg RetryConfig, operation func() err
 			return nil // Success
 		}
 	}
-	
+
 	return fmt.Errorf("operation failed after %d attempts: %w", cfg.MaxRetries+1, lastErr)
+}
+
+// ErrorType represents the classification of different types of errors
+type ErrorType int
+
+const (
+	ErrorTypeUnknown ErrorType = iota
+	ErrorTypeConnection
+	ErrorTypeTimeout
+	ErrorTypeAuthentication
+	ErrorTypeAuthorization
+	ErrorTypeRateLimit
+	ErrorTypeResourceExhausted
+	ErrorTypeUnavailable
+	ErrorTypeInternal
+	ErrorTypeInvalidArgument
+	ErrorTypeNotFound
+	ErrorTypeAlreadyExists
+	ErrorTypeFailedPrecondition
+	ErrorTypeAborted
+	ErrorTypeOutOfRange
+	ErrorTypeUnimplemented
+	ErrorTypeDataLoss
+	ErrorTypeCancelled
+	ErrorTypeDeadlineExceeded
+)
+
+// String returns the string representation of the error type
+func (et ErrorType) String() string {
+	switch et {
+	case ErrorTypeConnection:
+		return "connection"
+	case ErrorTypeTimeout:
+		return "timeout"
+	case ErrorTypeAuthentication:
+		return "authentication"
+	case ErrorTypeAuthorization:
+		return "authorization"
+	case ErrorTypeRateLimit:
+		return "rate_limit"
+	case ErrorTypeResourceExhausted:
+		return "resource_exhausted"
+	case ErrorTypeUnavailable:
+		return "unavailable"
+	case ErrorTypeInternal:
+		return "internal"
+	case ErrorTypeInvalidArgument:
+		return "invalid_argument"
+	case ErrorTypeNotFound:
+		return "not_found"
+	case ErrorTypeAlreadyExists:
+		return "already_exists"
+	case ErrorTypeFailedPrecondition:
+		return "failed_precondition"
+	case ErrorTypeAborted:
+		return "aborted"
+	case ErrorTypeOutOfRange:
+		return "out_of_range"
+	case ErrorTypeUnimplemented:
+		return "unimplemented"
+	case ErrorTypeDataLoss:
+		return "data_loss"
+	case ErrorTypeCancelled:
+		return "cancelled"
+	case ErrorTypeDeadlineExceeded:
+		return "deadline_exceeded"
+	default:
+		return "unknown"
+	}
+}
+
+// GrpcError represents a classified gRPC error with additional context
+type GrpcError struct {
+	Type        ErrorType
+	Code        codes.Code
+	Message     string
+	Method      string
+	Details     []string
+	Retryable   bool
+	OriginalErr error
+}
+
+// Error implements the error interface
+func (e *GrpcError) Error() string {
+	return fmt.Sprintf("%s (%s): %s", e.Type.String(), e.Method, e.Message)
+}
+
+// Unwrap returns the original error for error wrapping
+func (e *GrpcError) Unwrap() error {
+	return e.OriginalErr
+}
+
+// IsRetryable returns whether this error should be retried
+func (e *GrpcError) IsRetryable() bool {
+	return e.Retryable
+}
+
+// classifyGrpcError analyzes a gRPC error and returns a classified GrpcError
+func classifyGrpcError(method string, err error) *GrpcError {
+	if err == nil {
+		return nil
+	}
+
+	grpcErr := &GrpcError{
+		Method:      method,
+		OriginalErr: err,
+	}
+
+	// Check for gRPC status errors
+	if st, ok := status.FromError(err); ok {
+		grpcErr.Code = st.Code()
+		grpcErr.Message = st.Message()
+
+		// Collect details if any
+		for _, d := range st.Details() {
+			if pm, ok := d.(proto.Message); ok {
+				b, _ := protojson.Marshal(pm)
+				grpcErr.Details = append(grpcErr.Details, string(b))
+			}
+		}
+
+		// Classify based on gRPC status code
+		switch st.Code() {
+		case codes.Canceled:
+			grpcErr.Type = ErrorTypeCancelled
+			grpcErr.Retryable = false // Don't retry cancelled operations
+		case codes.Unknown:
+			grpcErr.Type = ErrorTypeUnknown
+			grpcErr.Retryable = true // May be transient
+		case codes.InvalidArgument:
+			grpcErr.Type = ErrorTypeInvalidArgument
+			grpcErr.Retryable = false // Client error, don't retry
+		case codes.DeadlineExceeded:
+			grpcErr.Type = ErrorTypeDeadlineExceeded
+			grpcErr.Retryable = true // Network timeout, retry possible
+		case codes.NotFound:
+			grpcErr.Type = ErrorTypeNotFound
+			grpcErr.Retryable = false // Resource doesn't exist
+		case codes.AlreadyExists:
+			grpcErr.Type = ErrorTypeAlreadyExists
+			grpcErr.Retryable = false // Resource conflict
+		case codes.PermissionDenied:
+			grpcErr.Type = ErrorTypeAuthorization
+			grpcErr.Retryable = false // Authorization failure
+		case codes.ResourceExhausted:
+			grpcErr.Type = ErrorTypeResourceExhausted
+			grpcErr.Retryable = true // May be temporary resource exhaustion
+		case codes.FailedPrecondition:
+			grpcErr.Type = ErrorTypeFailedPrecondition
+			grpcErr.Retryable = false // Preconditions not met
+		case codes.Aborted:
+			grpcErr.Type = ErrorTypeAborted
+			grpcErr.Retryable = true // May be transient
+		case codes.OutOfRange:
+			grpcErr.Type = ErrorTypeOutOfRange
+			grpcErr.Retryable = false // Invalid range
+		case codes.Unimplemented:
+			grpcErr.Type = ErrorTypeUnimplemented
+			grpcErr.Retryable = false // Method not implemented
+		case codes.Internal:
+			grpcErr.Type = ErrorTypeInternal
+			grpcErr.Retryable = true // Server internal error, may be transient
+		case codes.Unavailable:
+			grpcErr.Type = ErrorTypeUnavailable
+			grpcErr.Retryable = true // Service unavailable, definitely retry
+		case codes.DataLoss:
+			grpcErr.Type = ErrorTypeDataLoss
+			grpcErr.Retryable = false // Data corruption, don't retry
+		case codes.Unauthenticated:
+			grpcErr.Type = ErrorTypeAuthentication
+			grpcErr.Retryable = false // Authentication failure
+		default:
+			grpcErr.Type = ErrorTypeUnknown
+			grpcErr.Retryable = false // Conservative default
+		}
+
+		return grpcErr
+	}
+
+	// Handle non-gRPC errors (connection errors, etc.)
+	errStr := err.Error()
+	grpcErr.Message = errStr
+
+	// Classify based on error message patterns
+	if strings.Contains(errStr, "connection") || strings.Contains(errStr, "dial") ||
+		strings.Contains(errStr, "network") || strings.Contains(errStr, "timeout") {
+		grpcErr.Type = ErrorTypeConnection
+		grpcErr.Retryable = true
+	} else if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") {
+		grpcErr.Type = ErrorTypeTimeout
+		grpcErr.Retryable = true
+	} else {
+		grpcErr.Type = ErrorTypeUnknown
+		grpcErr.Retryable = false
+	}
+
+	return grpcErr
+}
+
+// formatGrpcError returns a richer error string including status code and details
+func formatGrpcError(prefix, method string, err error) error {
+	classifiedErr := classifyGrpcError(method, err)
+	if classifiedErr != nil {
+		return classifiedErr
+	}
+	return fmt.Errorf("%s (%s): %w", prefix, method, err)
+}
+
+// logAtLevel emits a structured message at a given level
+func logAtLevel(log *service.Logger, level string, msg string, method string, code string, dur time.Duration) {
+	entry := log.With("method", method, "code", code, "duration", dur.String())
+	switch strings.ToLower(level) {
+	case "warn", "warning":
+		entry.Warnf(msg)
+	case "info":
+		entry.Infof(msg)
+	default:
+		entry.Debugf(msg)
+	}
+}
+
+func (mr *MethodResolver) cacheKey(cfg *Config) string {
+	if len(cfg.ProtoFiles) == 0 {
+		return cfg.Method + "|reflect"
+	}
+	return cfg.Method + "|" + strings.Join(cfg.ProtoFiles, ",") + "|" + strings.Join(cfg.IncludePaths, ",")
 }

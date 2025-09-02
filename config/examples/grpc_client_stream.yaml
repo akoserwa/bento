@@ -12,8 +12,7 @@ output:
     method: /ingest.Ingest/Stream
     proto_files: [ "ingest.proto", "google/protobuf/struct.proto" ]
     include_paths: [ "cmd/tools/grpc_test_server/pb" ]
-    tls:
-      enabled: false
+    # TLS disabled in this example
     
     # Client streaming configuration
     call_timeout: 30s

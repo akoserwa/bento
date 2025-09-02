@@ -1,24 +1,15 @@
-# Test configuration showcasing enhanced gRPC features
 input:
-  generate:
-    count: 3
-    interval: 2s
-    mapping: |
-      root = { 
-        "service": "enhanced-test"
-      }
-
-output:
-  type: grpc_client
   grpc_client:
-    rpc_type: unary
     address: 127.0.0.1:50051
-    method: /grpc.health.v1.Health/Check
-    tls:
-      enabled: false
+    method: /echo.Echo/Stream
+    rpc_type: server_stream
+    request_json: '{"message":"enhanced-test"}'
+    proto_files: [ "echo.proto", "google/protobuf/struct.proto" ]
+    include_paths: [ "cmd/tools/grpc_test_server/pb" ]
+    # TLS disabled in this example
     
     # Test enhanced performance features
-    max_connection_pool_size: 3
+    max_connection_pool_size: 1
     connection_idle_timeout: 5m
     enable_message_pool: true
     
@@ -48,3 +39,6 @@ output:
     keepalive_time: 30s
     keepalive_timeout: 5s
     keepalive_permit_without_stream: false
+
+output:
+  stdout: {}

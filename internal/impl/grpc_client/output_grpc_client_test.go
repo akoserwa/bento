@@ -9,15 +9,13 @@ import (
 )
 
 func TestOutput_injectMetadataIntoContext(t *testing.T) {
-	u := &UnifiedOutput{
-		cfg: &Config{
-			BearerToken:     "secret",
-			AuthHeaders:     map[string]string{"x-api-key": "k"},
-			DefaultMetadata: map[string]string{"foo": "bar"},
-		},
+	cfg := &Config{
+		BearerToken:     "secret",
+		AuthHeaders:     map[string]string{"x-api-key": "k"},
+		DefaultMetadata: map[string]string{"foo": "bar"},
 	}
 	ctx := context.Background()
-	ctx = u.injectMetadataIntoContext(ctx)
+	ctx = injectMetadataIntoContext(ctx, cfg)
 	md, ok := metadata.FromOutgoingContext(ctx)
 	if !ok {
 		t.Fatal("expected outgoing metadata in context")

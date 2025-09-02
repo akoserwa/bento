@@ -10,7 +10,6 @@ import (
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
 	"github.com/jhump/protoreflect/dynamic/grpcdynamic"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	structpb "google.golang.org/protobuf/types/known/structpb"
 
@@ -18,51 +17,13 @@ import (
 )
 
 func genericOutputSpec() *service.ConfigSpec {
-	return service.NewConfigSpec().
-		Version("1.11.0").
-		Categories("Services").
+	return createBaseConfigSpec().
 		Summary("Call an arbitrary gRPC method (unary, client_stream, or bidi) using reflection to resolve types with enhanced security and performance").
-		Field(service.NewStringField(fieldAddress).Default("127.0.0.1:50051")).
-		Field(service.NewStringField(fieldMethod).Description("Full method name, e.g. /pkg.Service/Method")).
 		Field(service.NewStringField(fieldRPCType).Default("unary").Description("One of: unary, client_stream, bidi")).
-		Field(service.NewTLSToggledField(fieldTLS)).
-		Field(service.NewStringField("bearer_token").Secret().Optional()).
-		Field(service.NewStringMapField("auth_headers").Optional()).
-		Field(service.NewStringField("authority").Optional()).
-		Field(service.NewStringField("user_agent").Optional()).
-		Field(service.NewStringField("load_balancing_policy").Default("pick_first")).
-		Field(service.NewIntField("max_send_msg_bytes").Default(0)).
-		Field(service.NewIntField("max_recv_msg_bytes").Default(0)).
-		Field(service.NewDurationField("keepalive_time").Default("0s")).
-		Field(service.NewDurationField("keepalive_timeout").Default("0s")).
-		Field(service.NewBoolField("keepalive_permit_without_stream").Default(false)).
-		Field(service.NewDurationField("call_timeout").Default("0s")).
-		Field(service.NewStringListField("proto_files").Optional()).
-		Field(service.NewStringListField("include_paths").Optional()).
 		Field(service.NewStringField("session_key_meta").Default("session_id").Description("Bidi: message metadata key used to route messages to a specific stream session")).
 		Field(service.NewDurationField("session_idle_timeout").Default("60s").Description("Bidi: closes an idle session stream after this duration")).
 		Field(service.NewDurationField("session_max_lifetime").Default("10m").Description("Bidi: closes a session stream after this lifetime to rotate connections")).
 		Field(service.NewBoolField("log_responses").Default(false).Description("Bidi: if enabled, receives server messages and logs them as debug entries")).
-		// Security enhancements
-		Field(service.NewBoolField("tls_skip_verify").Default(false).Description("Skip TLS certificate verification (insecure)")).
-		Field(service.NewStringField("tls_server_name").Optional().Description("Override TLS server name for verification")).
-		Field(service.NewStringField("tls_ca_cert").Optional().Description("Custom CA certificate for TLS")).
-		Field(service.NewStringField("tls_client_cert").Optional().Description("Client certificate for mutual TLS")).
-		Field(service.NewStringField("tls_client_key").Secret().Optional().Description("Client private key for mutual TLS")).
-		Field(service.NewBoolField("require_transport_security").Default(false).Description("Force transport security even without TLS")).
-		// Performance options
-		Field(service.NewIntField("max_connection_pool_size").Default(1).Description("Maximum number of connections in pool")).
-		Field(service.NewDurationField("connection_idle_timeout").Default("30m").Description("Connection idle timeout")).
-		Field(service.NewBoolField("enable_message_pool").Default(false).Description("Enable message object pooling for performance")).
-		// gRPC best practices
-		Field(service.NewBoolField("enable_interceptors").Default(true).Description("Enable gRPC interceptors for observability")).
-		Field(service.NewBoolField("propagate_deadlines").Default(true).Description("Propagate context deadlines to gRPC calls")).
-		Field(service.NewStringMapField("default_metadata").Optional().Description("Default metadata to include in all calls")).
-		// Retry policy
-		Field(service.NewIntField("retry_max_attempts").Default(0).Description("Maximum retry attempts (0 disables retries)")).
-		Field(service.NewDurationField("retry_initial_backoff").Default("1s").Description("Initial backoff for retries")).
-		Field(service.NewDurationField("retry_max_backoff").Default("30s").Description("Maximum backoff for retries")).
-		Field(service.NewFloatField("retry_backoff_multiplier").Default(2.0).Description("Backoff multiplier for retries")).
 		Field(service.NewOutputMaxInFlightField())
 }
 
@@ -348,6 +309,9 @@ func newUnifiedOutput(conf *service.ParsedConfig, res *service.Resources) (servi
 
 	maxInFlight, _ := conf.FieldMaxInFlight()
 
+	// Attach logger for common code
+	cfg.Logger = res.Logger()
+
 	connMgr, err := NewConnectionManager(context.Background(), cfg)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create connection manager: %w", err)
@@ -385,7 +349,17 @@ func newUnifiedOutput(conf *service.ParsedConfig, res *service.Resources) (servi
 		methodResolver: methodResolver,
 		method:         method,
 		sessionMgr:     sessionMgr,
-		retryConfig:    DefaultRetryConfig(),
+		retryConfig: func() RetryConfig {
+			r := DefaultRetryConfig()
+			if cfg.RetryPolicy != nil {
+				r.InitialBackoff = cfg.RetryPolicy.InitialBackoff
+				r.MaxBackoff = cfg.RetryPolicy.MaxBackoff
+				if cfg.RetryPolicy.MaxAttempts > 0 {
+					r.MaxRetries = cfg.RetryPolicy.MaxAttempts - 1
+				}
+			}
+			return r
+		}(),
 	}, maxInFlight, nil
 }
 
@@ -434,7 +408,7 @@ func (u *UnifiedOutput) Write(ctx context.Context, msg *service.Message) error {
 	// Build request message from the incoming message with optional pooling
 	var requestMsg *dynamic.Message
 	var shouldReturnToPool bool
-	
+
 	// Use message pool if enabled for better performance
 	if inputPool, _ := u.methodResolver.GetMessagePools(u.method.GetFullyQualifiedName()); inputPool != nil {
 		requestMsg = inputPool.Get()
@@ -442,7 +416,7 @@ func (u *UnifiedOutput) Write(ctx context.Context, msg *service.Message) error {
 	} else {
 		requestMsg = dynamic.NewMessage(u.method.GetInputType())
 	}
-	
+
 	// Ensure message is returned to pool when done
 	if shouldReturnToPool {
 		defer func() {
@@ -451,7 +425,7 @@ func (u *UnifiedOutput) Write(ctx context.Context, msg *service.Message) error {
 			}
 		}()
 	}
-	
+
 	msgBytes, err := msg.AsBytes()
 	if err != nil {
 		return fmt.Errorf("failed to get message bytes: %w", err)
@@ -485,6 +459,7 @@ func (u *UnifiedOutput) handleUnaryWrite(ctx context.Context, requestMsg *dynami
 
 	// Enhanced context handling with proper deadline propagation
 	callCtx := u.enhanceCallContext(ctx)
+	callCtx = context.WithValue(callCtx, ctxKeyConnMgr, u.connMgr)
 	var cancel context.CancelFunc
 
 	if u.cfg.CallTimeout > 0 {
@@ -498,7 +473,7 @@ func (u *UnifiedOutput) handleUnaryWrite(ctx context.Context, requestMsg *dynami
 
 	_, err = stub.InvokeRpc(callCtx, u.method, requestMsg)
 	if err != nil {
-		return fmt.Errorf("unary RPC call failed: %w", err)
+		return formatGrpcError("grpc_client unary call failed", u.method.GetFullyQualifiedName(), err)
 	}
 
 	return nil
@@ -506,78 +481,9 @@ func (u *UnifiedOutput) handleUnaryWrite(ctx context.Context, requestMsg *dynami
 
 // enhanceCallContext enhances the context for gRPC calls with proper deadline and metadata handling
 func (u *UnifiedOutput) enhanceCallContext(ctx context.Context) context.Context {
-	// Preserve existing context values while enhancing for gRPC
-	enhancedCtx := ctx
-
-	// Ensure proper deadline propagation
-	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
-		remaining := time.Until(deadline)
-		// Reserve some time for connection establishment and cleanup
-		if remaining > 500*time.Millisecond {
-			adjustedTimeout := remaining - 100*time.Millisecond
-			newCtx, cancel := context.WithTimeout(context.Background(), adjustedTimeout)
-			_ = cancel // Don't defer here, caller will handle
-			// Copy important context values
-			for _, key := range []interface{}{"session_id", "trace_id", "request_id"} {
-				if val := ctx.Value(key); val != nil {
-					newCtx = context.WithValue(newCtx, key, val)
-				}
-			}
-			enhancedCtx = newCtx
-		}
-	}
-
-	// Apply default metadata and auth headers to context
-	enhancedCtx = u.injectMetadataIntoContext(enhancedCtx)
-	
-	return enhancedCtx
-}
-
-// injectMetadataIntoContext adds default_metadata and auth_headers to the gRPC context
-func (u *UnifiedOutput) injectMetadataIntoContext(ctx context.Context) context.Context {
-	// Collect all metadata to inject
-	md := make(map[string]string)
-	
-	// Add default metadata from config
-	if len(u.cfg.DefaultMetadata) > 0 {
-		for k, v := range u.cfg.DefaultMetadata {
-			md[k] = v
-		}
-	}
-	
-	// Add auth headers from config
-	if len(u.cfg.AuthHeaders) > 0 {
-		for k, v := range u.cfg.AuthHeaders {
-			md[k] = v
-		}
-	}
-	
-	// Add bearer token if configured
-	if u.cfg.BearerToken != "" {
-		md["authorization"] = "Bearer " + u.cfg.BearerToken
-	}
-	
-	// If we have metadata to inject, add it to the context
-	if len(md) > 0 {
-		// Get existing metadata if any
-		existingMD, ok := metadata.FromOutgoingContext(ctx)
-		if ok {
-			// Merge with existing metadata
-			for k, v := range existingMD {
-				if _, exists := md[k]; !exists {
-					if len(v) > 0 {
-						md[k] = v[0] // Take first value
-					}
-				}
-			}
-		}
-		
-		// Create new metadata and attach to context
-		newMD := metadata.New(md)
-		ctx = metadata.NewOutgoingContext(ctx, newMD)
-	}
-	
-	return ctx
+	return enhanceCallContext(ctx, u.cfg, func(c context.Context) context.Context {
+		return injectMetadataIntoContext(c, u.cfg)
+	})
 }
 
 func (u *UnifiedOutput) handleClientStreamWrite(ctx context.Context, requestMsg *dynamic.Message, msg *service.Message) error {
@@ -687,6 +593,7 @@ func (u *UnifiedOutput) createClientStreamSession(ctx context.Context, sessionKe
 
 	// Enhanced context handling for streaming
 	streamCtx := u.enhanceCallContext(ctx)
+	streamCtx = context.WithValue(streamCtx, ctxKeyConnMgr, u.connMgr)
 	var cancel context.CancelFunc
 
 	if u.cfg.CallTimeout > 0 {
@@ -700,7 +607,7 @@ func (u *UnifiedOutput) createClientStreamSession(ctx context.Context, sessionKe
 	clientStream, err := stub.InvokeRpcClientStream(streamCtx, u.method)
 	if err != nil {
 		cancel()
-		return fmt.Errorf("failed to create client stream: %w", err)
+		return formatGrpcError("grpc_client failed to create client stream", u.method.GetFullyQualifiedName(), err)
 	}
 
 	session := NewStreamSession(clientStream, cancel)
@@ -719,6 +626,7 @@ func (u *UnifiedOutput) createBidiStreamSession(ctx context.Context, sessionKey 
 
 	// Enhanced context handling for bidirectional streaming
 	streamCtx := u.enhanceCallContext(ctx)
+	streamCtx = context.WithValue(streamCtx, ctxKeyConnMgr, u.connMgr)
 	var cancel context.CancelFunc
 
 	if u.cfg.CallTimeout > 0 {
@@ -732,7 +640,7 @@ func (u *UnifiedOutput) createBidiStreamSession(ctx context.Context, sessionKey 
 	bidiStream, err := stub.InvokeRpcBidiStream(streamCtx, u.method)
 	if err != nil {
 		cancel()
-		return fmt.Errorf("failed to create bidi stream: %w", err)
+		return formatGrpcError("grpc_client failed to create bidi stream", u.method.GetFullyQualifiedName(), err)
 	}
 
 	session := NewStreamSession(bidiStream, cancel)
@@ -765,7 +673,8 @@ func (u *UnifiedOutput) handleBidiResponses(bidiStream *grpcdynamic.BidiStream, 
 		case *dynamic.Message:
 			respBytes, marshalErr = v.MarshalJSON()
 		case *structpb.Struct:
-			respBytes, marshalErr = protojson.Marshal(v)
+			m := protojson.MarshalOptions{EmitUnpopulated: u.cfg.JSONEmitDefaults, UseProtoNames: u.cfg.JSONUseProtoNames, AllowPartial: true, Multiline: false, Indent: ""}
+			respBytes, marshalErr = m.Marshal(v)
 		default:
 			// Skip logging for unknown types
 			continue

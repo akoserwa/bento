@@ -6,8 +6,7 @@ input:
     request_json: '{"message":"hi"}'
     proto_files: [ "echo.proto", "google/protobuf/struct.proto" ]
     include_paths: [ "cmd/tools/grpc_test_server/pb" ]
-    tls:
-      enabled: false
+    # TLS disabled in this example
     
     # Server streaming configuration
     call_timeout: 0s  # No timeout for long-running streams

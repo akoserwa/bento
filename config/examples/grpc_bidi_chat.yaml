@@ -1,11 +1,12 @@
 input:
   generate:
+    count: 5
     interval: 1s
     mapping: |
       root = { "message": "hello from bento" }
   processors:
     - bloblang: |
-        meta session_id = now().ts_unix()
+        meta session_id = "bidi-1"
 
 output:
   type: grpc_client
@@ -15,8 +16,7 @@ output:
     method: /chat.Chat/Stream
     proto_files: [ "chat.proto", "google/protobuf/struct.proto" ]
     include_paths: [ "cmd/tools/grpc_test_server/pb" ]
-    tls:
-      enabled: false
+    # TLS disabled in this example
     
     # Session management for bidirectional streaming
     session_key_meta: session_id

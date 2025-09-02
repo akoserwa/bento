@@ -9,13 +9,13 @@ import (
 )
 
 func TestInput_injectMetadataIntoContext(t *testing.T) {
-	g := &genericInput{cfg: &Config{
+	cfg := &Config{
 		BearerToken:     "t",
 		AuthHeaders:     map[string]string{"a": "1"},
 		DefaultMetadata: map[string]string{"b": "2"},
-	}}
+	}
 	ctx := context.Background()
-	ctx = g.injectMetadataIntoContext(ctx)
+	ctx = injectMetadataIntoContext(ctx, cfg)
 	md, ok := metadata.FromOutgoingContext(ctx)
 	if !ok {
 		t.Fatal("expected outgoing metadata in context")
