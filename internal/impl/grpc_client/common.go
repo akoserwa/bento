@@ -362,16 +362,7 @@ func extractStreamingConfig(conf *service.ParsedConfig, cfg *Config) {
 	cfg.LogResponses, _ = conf.FieldBool("log_responses")
 }
 
-// extractSecurityConfig extracts security enhancement configuration
-func extractSecurityConfig(conf *service.ParsedConfig, cfg *Config) {
-	cfg.EnableInterceptors, _ = conf.FieldBool("enable_interceptors")
-	cfg.PropagateDeadlines, _ = conf.FieldBool("propagate_deadlines")
-	cfg.DefaultMetadata, _ = conf.FieldStringMap("default_metadata")
-	cfg.DefaultMetadataBin, _ = conf.FieldStringMap("default_metadata_bin")
-	cfg.JSONEmitDefaults, _ = conf.FieldBool("json_emit_defaults")
-	cfg.JSONUseProtoNames, _ = conf.FieldBool("json_use_proto_names")
-	cfg.JSONDiscardUnknown, _ = conf.FieldBool("json_discard_unknown")
-}
+// extractSecurityConfig removed; merged into extractBestPracticesConfig
 
 // extractPerformanceConfig extracts performance optimization configuration
 func extractPerformanceConfig(conf *service.ParsedConfig, cfg *Config) {
@@ -841,17 +832,7 @@ func createConnection(ctx context.Context, cfg *Config) (*grpc.ClientConn, error
 		return nil, fmt.Errorf("failed to build dial options: %w", err)
 	}
 
-	// Ensure we block until connected (up to connect timeout) like grpcurl
-	opts = append(opts, grpc.WithBlock())
-
-	dialCtx := ctx
-	var cancel context.CancelFunc
-	if cfg.ConnectTimeout > 0 {
-		dialCtx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
-		defer cancel()
-	}
-
-	conn, err := grpc.DialContext(dialCtx, cfg.Address, opts...)
+	conn, err := grpc.NewClient(cfg.Address, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC client: %w", err)
 	}
@@ -889,28 +870,7 @@ func isConnectionHealthy(conn *grpc.ClientConn) bool {
 }
 
 // isConnectionHealthyWithHistory validates connection health considering failure history
-func isConnectionHealthyWithHistory(entry *connectionEntry, maxFailures int, failureWindow time.Duration) bool {
-	if entry == nil || entry.conn == nil {
-		return false
-	}
-
-	// Check basic connection state first
-	if !isConnectionHealthy(entry.conn) {
-		return false
-	}
-
-	// Consider failure history
-	if entry.failureCount >= maxFailures {
-		// Check if failures are within the failure window
-		if time.Since(entry.lastFailure) < failureWindow {
-			return false
-		}
-		// Reset failure count if outside the window
-		entry.failureCount = 0
-	}
-
-	return true
-}
+// isConnectionHealthyWithHistory was unused; removed to satisfy staticcheck (U1000)
 
 // recordConnectionFailure records a failure for the connection entry with enhanced tracking
 func recordConnectionFailure(entry *connectionEntry) {
@@ -1183,18 +1143,15 @@ func (cm *ConnectionManager) cleanupIdleConnections() {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			cm.mu.RLock()
-			if cm.closed {
-				cm.mu.RUnlock()
-				return
-			}
+	for range ticker.C {
+		cm.mu.RLock()
+		if cm.closed {
 			cm.mu.RUnlock()
-
-			cm.pool.cleanupIdle()
+			return
 		}
+		cm.mu.RUnlock()
+
+		cm.pool.cleanupIdle()
 	}
 }
 
@@ -1451,29 +1408,6 @@ func buildDefaultCallOptions(cfg *Config) []grpc.CallOption {
 	}
 
 	return callOpts
-}
-
-// statusCodesToStrings converts gRPC status codes to string representation
-func statusCodesToStrings(codes []codes.Code) []string {
-	result := make([]string, len(codes))
-	for i, code := range codes {
-		// Use uppercase status code names as expected by gRPC service config
-		result[i] = code.String()
-	}
-	return result
-}
-
-// formatDurationForServiceConfig converts Go duration to gRPC service config format
-func formatDurationForServiceConfig(d time.Duration) string {
-	// gRPC service config expects duration in decimal form with units
-	// Examples: "1s", "0.5s", "100ms" -> "0.1s"
-	seconds := d.Seconds()
-	if seconds < 1.0 {
-		// For sub-second durations, use decimal seconds
-		return fmt.Sprintf("%.3fs", seconds)
-	}
-	// For longer durations, use whole seconds
-	return fmt.Sprintf("%.0fs", seconds)
 }
 
 // buildInterceptors creates gRPC interceptors for observability and best practices
@@ -1750,8 +1684,7 @@ func (mp *MessagePool) Put(msg *dynamic.Message) {
 
 // MethodResolver handles method resolution with caching and performance optimizations
 type MethodResolver struct {
-	cache        sync.Map // string -> *methodCacheEntry
-	messagePools sync.Map // string -> *MessagePool
+	cache sync.Map // string -> *methodCacheEntry
 }
 
 // methodCacheEntry holds both the method descriptor and message pools
