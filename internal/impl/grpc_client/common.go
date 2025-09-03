@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding"
 	_ "google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
@@ -151,6 +152,9 @@ func injectMetadataIntoContext(ctx context.Context, cfg *Config) context.Context
 			if decoded, err := base64.StdEncoding.DecodeString(v); err == nil {
 				merged.Append(strings.ToLower(k), string(decoded))
 			} else {
+				if cfg.Logger != nil {
+					cfg.Logger.With("key", k).Debugf("default_metadata_bin base64 decode failed; using raw value")
+				}
 				merged.Append(strings.ToLower(k), v)
 			}
 		}
@@ -319,11 +323,6 @@ func ParseConfigFromService(conf *service.ParsedConfig) (*Config, error) {
 	// Extract retry policy configuration
 	extractRetryPolicyConfig(conf, cfg)
 
-	// Enhanced security validation
-	if err := validateSecurityConfig(cfg); err != nil {
-		return nil, fmt.Errorf("security validation failed: %w", err)
-	}
-
 	return cfg, nil
 }
 
@@ -439,58 +438,6 @@ func extractRetryPolicyConfig(conf *service.ParsedConfig, cfg *Config) {
 	}
 }
 
-// validateSecurityConfig performs comprehensive security validation
-func validateSecurityConfig(cfg *Config) error {
-	// Do not enforce TLS while disabled
-	if err := validateSecurityHeaders(cfg.AuthHeaders); err != nil {
-		return fmt.Errorf("security header validation failed: %w", err)
-	}
-	return nil
-}
-
-// validateSecurityHeaders validates that custom headers don't contain sensitive information or security risks
-func validateSecurityHeaders(headers map[string]string) error {
-	if len(headers) == 0 {
-		return nil
-	}
-
-	// List of potentially dangerous headers that should not be set by users
-	dangerousHeaders := map[string]bool{
-		"authorization":     true,
-		"cookie":            true,
-		"set-cookie":        true,
-		"x-forwarded-for":   true,
-		"x-real-ip":         true,
-		"x-client-ip":       true,
-		"x-forwarded-host":  true,
-		"x-forwarded-proto": true,
-		"x-forwarded-port":  true,
-		"x-original-uri":    true,
-		"x-original-url":    true,
-		"x-scheme":          true,
-		"x-request-id":      true,
-		"traceparent":       true,
-		"tracestate":        true,
-	}
-
-	for header := range headers {
-		headerLower := strings.ToLower(header)
-		if dangerousHeaders[headerLower] {
-			return fmt.Errorf("header '%s' is not allowed in auth_headers as it may conflict with internal headers or pose security risks", header)
-		}
-
-		// Check for headers that might contain sensitive information
-		if strings.Contains(headerLower, "password") ||
-			strings.Contains(headerLower, "secret") ||
-			strings.Contains(headerLower, "token") ||
-			strings.Contains(headerLower, "key") {
-			// Sensitive header name detected; continue but do not log here
-		}
-	}
-
-	return nil
-}
-
 // headerCreds implements credentials.PerRPCCredentials with enhanced security
 type headerCreds struct {
 	token      string
@@ -506,51 +453,15 @@ func (h headerCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map
 		md["authorization"] = "Bearer " + h.token
 	}
 
-	// Add custom headers with security validation
+	// Add custom headers
 	for k, v := range h.headers {
-		if err := validateHeaderName(k); err != nil {
-			// Log the error but continue (don't fail the entire request)
-			// Logger not available in this scope
-			continue
-		}
 		if err := validateHeaderValue(v); err != nil {
-			// Log the error but continue (don't fail the entire request)
-			// Logger not available in this scope
 			continue
 		}
 		md[strings.ToLower(k)] = v
 	}
 
 	return md, nil
-}
-
-// validateHeaderName validates that a header name is safe and properly formatted
-func validateHeaderName(name string) error {
-	if name == "" {
-		return errors.New("header name cannot be empty")
-	}
-
-	if len(name) > 128 {
-		return errors.New("header name is too long (maximum 128 characters)")
-	}
-
-	// Header names must follow HTTP header naming rules
-	for i, char := range name {
-		if i == 0 {
-			// First character must be a letter or digit
-			if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')) {
-				return fmt.Errorf("header name must start with a letter or digit")
-			}
-		} else {
-			// Subsequent characters can be letters, digits, or hyphens
-			if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
-				(char >= '0' && char <= '9') || char == '-') {
-				return fmt.Errorf("header name contains invalid character: %c", char)
-			}
-		}
-	}
-
-	return nil
 }
 
 // validateHeaderValue validates that a header value is safe
@@ -1020,6 +931,8 @@ func (cm *ConnectionManager) GetConnectionStats() map[string]interface{} {
 			// Health metrics
 			if isConnectionHealthy(entry.conn) {
 				healthyConnections++
+			} else {
+				inUseCount++
 			}
 
 			if entry.failureCount > 0 {
@@ -1107,7 +1020,7 @@ func (cp *ConnectionPool) getConnection() (*grpc.ClientConn, error) {
 
 	// Second pass: Find the best available connection (prioritize by failure rate)
 	var bestEntry *connectionEntry
-	var bestScore int = -1
+	var bestScore = -1
 
 	for i, entry := range cp.connections {
 		// Calculate connection score (lower is better)
@@ -1429,6 +1342,9 @@ func buildDefaultCallOptions(cfg *Config) []grpc.CallOption {
 
 	// Compression
 	if cfg.Compression != "" {
+		if encoding.GetCompressor(cfg.Compression) == nil && cfg.Logger != nil {
+			cfg.Logger.With("compressor", cfg.Compression).Warnf("unknown compressor; calls may fail unless a custom compressor is registered")
+		}
 		callOpts = append(callOpts, grpc.UseCompressor(cfg.Compression))
 	}
 
