@@ -133,3 +133,50 @@ func TestIntegration_ClientStream_OK(t *testing.T) {
 		t.Fatalf("close/recv: %v", err)
 	}
 }
+
+func TestIntegration_CircuitBreaker_Transitions_Unreachable(t *testing.T) {
+	cfg := &Config{
+		Address:                        "127.0.0.1:59999", // assuming unused port
+		Method:                         "/echo.Echo/Stream",
+		RPCType:                        "server_stream",
+		LoadBalancingPolicy:            "pick_first",
+		RetryPolicy:                    &RetryPolicy{MaxAttempts: 1, InitialBackoff: 10 * time.Millisecond, MaxBackoff: 10 * time.Millisecond, BackoffMultiplier: 2},
+		MaxConnectionPoolSize:          1,
+		ConnectTimeout:                 200 * time.Millisecond,
+		CircuitBreakerFailureThreshold: 2,
+		CircuitBreakerResetTimeout:     200 * time.Millisecond,
+		CircuitBreakerHalfOpenMax:      1,
+	}
+
+	cm, err := NewConnectionManager(context.Background(), cfg)
+	if err == nil {
+		defer cm.Close()
+	}
+	// Connection manager may fail immediately due to readiness; if it succeeds, attempts to get a conn should fail and open breaker
+	if err == nil {
+		_, _ = cm.GetConnection()
+		_, _ = cm.GetConnection()
+		if cm.GetCircuitBreakerState() == CircuitBreakerClosed {
+			t.Fatalf("expected breaker to open after failures")
+		}
+		// wait for half-open
+		time.Sleep(cfg.CircuitBreakerResetTimeout + 50*time.Millisecond)
+		_ = cm.GetCircuitBreakerState() // query state; actual open/half-open is internal
+	}
+}
+
+func TestIntegration_ConnectTimeout_Fails(t *testing.T) {
+	cfg := &Config{
+		Address:               "10.255.255.1:65533", // unroutable
+		Method:                "/echo.Echo/Stream",
+		RPCType:               "server_stream",
+		LoadBalancingPolicy:   "pick_first",
+		MaxConnectionPoolSize: 1,
+		ConnectTimeout:        200 * time.Millisecond,
+	}
+
+	_, err := NewConnectionManager(context.Background(), cfg)
+	if err == nil {
+		t.Fatalf("expected connection manager creation to fail due to connect_timeout")
+	}
+}

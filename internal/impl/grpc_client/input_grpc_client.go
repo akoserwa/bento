@@ -349,7 +349,7 @@ func (g *genericInput) reopenStreamWithRetry(ctx context.Context, reqJSON string
 		defer g.mu.Unlock()
 
 		if g.shutdown {
-			return fmt.Errorf("input is shutting down")
+			return errors.New("input is shutting down")
 		}
 
 		return g.openStreamLocked(ctx, requestMsg)

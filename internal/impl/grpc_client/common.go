@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -58,12 +59,16 @@ func createBaseConfigSpec() *service.ConfigSpec {
 		Field(service.NewDurationField("keepalive_timeout").Default("0s")).
 		Field(service.NewBoolField("keepalive_permit_without_stream").Default(false)).
 		Field(service.NewDurationField("call_timeout").Default("0s")).
+		Field(service.NewDurationField("connect_timeout").Default("0s")).
 		Field(service.NewStringListField("proto_files").Optional()).
 		Field(service.NewStringListField("include_paths").Optional()).
 		// Performance
 		Field(service.NewIntField("max_connection_pool_size").Default(1)).
 		Field(service.NewDurationField("connection_idle_timeout").Default("30m")).
 		Field(service.NewBoolField("enable_message_pool").Default(false)).
+		Field(service.NewDurationField("connection_cleanup_interval").Default("1m")).
+		Field(service.NewDurationField("connection_healthcheck_interval").Default("30s")).
+		Field(service.NewDurationField("connection_max_lifetime").Default("0s")).
 		// Best practices / metadata
 		Field(service.NewBoolField("enable_interceptors").Default(true)).
 		Field(service.NewBoolField("propagate_deadlines").Default(true)).
@@ -138,15 +143,15 @@ func injectMetadataIntoContext(ctx context.Context, cfg *Config) context.Context
 
 		// Add string metadata
 		for k, v := range md {
-			merged.Set(k, v)
+			merged.Set(strings.ToLower(k), v)
 		}
 
 		// Add binary metadata
 		for k, v := range cfg.DefaultMetadataBin {
 			if decoded, err := base64.StdEncoding.DecodeString(v); err == nil {
-				merged.Append(k, string(decoded))
+				merged.Append(strings.ToLower(k), string(decoded))
 			} else {
-				merged.Append(k, v)
+				merged.Append(strings.ToLower(k), v)
 			}
 		}
 
@@ -158,17 +163,16 @@ func injectMetadataIntoContext(ctx context.Context, cfg *Config) context.Context
 
 // Default timing configuration constants
 const (
-	defaultRetryBackoffInitial    = time.Second
-	defaultRetryBackoffMax        = 30 * time.Second
-	defaultConnectionIdleTimeout  = 30 * time.Minute
-	defaultSessionSweepInterval   = time.Minute
-	defaultConnectionPoolSize     = 1
-	defaultRetryMultiplier        = 2.0
-	defaultConnectionReleaseDelay = 100 * time.Millisecond
-	defaultCleanupTickerInterval  = time.Minute
-	defaultHealthCheckInterval    = 30 * time.Second
-	defaultMaxConnectionFailures  = 3
-	defaultFailureWindow          = 5 * time.Minute
+	defaultRetryBackoffInitial   = time.Second
+	defaultRetryBackoffMax       = 30 * time.Second
+	defaultConnectionIdleTimeout = 30 * time.Minute
+	defaultSessionSweepInterval  = time.Minute
+	defaultConnectionPoolSize    = 1
+	defaultRetryMultiplier       = 2.0
+	defaultCleanupTickerInterval = time.Minute
+	defaultHealthCheckInterval   = 30 * time.Second
+	defaultMaxConnectionFailures = 3
+	defaultFailureWindow         = 5 * time.Minute
 )
 
 // Magic numbers for message sizes and limits
@@ -514,7 +518,7 @@ func (h headerCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map
 			// Logger not available in this scope
 			continue
 		}
-		md[k] = v
+		md[strings.ToLower(k)] = v
 	}
 
 	return md, nil
@@ -523,11 +527,11 @@ func (h headerCreds) GetRequestMetadata(ctx context.Context, uri ...string) (map
 // validateHeaderName validates that a header name is safe and properly formatted
 func validateHeaderName(name string) error {
 	if name == "" {
-		return fmt.Errorf("header name cannot be empty")
+		return errors.New("header name cannot be empty")
 	}
 
 	if len(name) > 128 {
-		return fmt.Errorf("header name is too long (maximum 128 characters)")
+		return errors.New("header name is too long (maximum 128 characters)")
 	}
 
 	// Header names must follow HTTP header naming rules
@@ -552,16 +556,16 @@ func validateHeaderName(name string) error {
 // validateHeaderValue validates that a header value is safe
 func validateHeaderValue(value string) error {
 	if len(value) > 4096 {
-		return fmt.Errorf("header value is too long (maximum 4096 characters)")
+		return errors.New("header value is too long (maximum 4096 characters)")
 	}
 
 	// Check for control characters that could be used for header injection
 	for _, char := range value {
 		if char < 32 && char != '\t' {
-			return fmt.Errorf("header value contains control character")
+			return errors.New("header value contains control character")
 		}
 		if char == '\r' || char == '\n' {
-			return fmt.Errorf("header value contains CRLF characters (potential header injection)")
+			return errors.New("header value contains CRLF characters (potential header injection)")
 		}
 	}
 
@@ -837,6 +841,27 @@ func createConnection(ctx context.Context, cfg *Config) (*grpc.ClientConn, error
 		return nil, fmt.Errorf("failed to create gRPC client: %w", err)
 	}
 
+	// Readiness wait honoring connect_timeout (require Ready)
+	if cfg.ConnectTimeout > 0 {
+		ctxWait, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
+		defer cancel()
+		// Proactively attempt to connect so we don't stay idle until first RPC
+		conn.Connect()
+		for {
+			st := conn.GetState()
+			if st == connectivity.Ready {
+				break
+			}
+			if !conn.WaitForStateChange(ctxWait, st) {
+				_ = conn.Close()
+				if err := ctxWait.Err(); err != nil {
+					return nil, err
+				}
+				return nil, errors.New("connection not ready within connect_timeout")
+			}
+		}
+	}
+
 	return conn, nil
 }
 
@@ -926,12 +951,12 @@ func (cm *ConnectionManager) GetConnection() (*grpc.ClientConn, error) {
 	defer cm.mu.RUnlock()
 
 	if cm.closed {
-		return nil, fmt.Errorf("connection manager is closed")
+		return nil, errors.New("connection manager is closed")
 	}
 
 	// Check circuit breaker before attempting to get connection
 	if !cm.circuitBreaker.CanExecute() {
-		return nil, fmt.Errorf("circuit breaker is open - service unavailable")
+		return nil, errors.New("circuit breaker is open - service unavailable")
 	}
 
 	conn, err := cm.pool.getConnection()
@@ -1041,7 +1066,7 @@ func (cp *ConnectionPool) getConnection() (*grpc.ClientConn, error) {
 	defer cp.mu.Unlock()
 
 	if cp.closed {
-		return nil, fmt.Errorf("connection pool is closed")
+		return nil, errors.New("connection pool is closed")
 	}
 
 	// First pass: Try to find a healthy connection in round-robin order
@@ -1131,7 +1156,7 @@ func (cp *ConnectionPool) getConnection() (*grpc.ClientConn, error) {
 		return bestEntry.conn, nil
 	}
 
-	return nil, fmt.Errorf("no connections available in pool")
+	return nil, errors.New("no connections available in pool")
 }
 
 // cleanupIdleConnections periodically cleans up idle connections
@@ -1521,12 +1546,10 @@ func enhanceContextWithDeadlines(ctx context.Context) context.Context {
 		// Calculate remaining time
 		remaining := time.Until(deadline)
 
-		// If deadline is too close, extend it slightly to avoid immediate failures
+		// If deadline is too close, leave as-is (avoid creating new timers)
 		minRemainingTime := 100 * time.Millisecond
 		if remaining < minRemainingTime {
-			newCtx, cancel := context.WithTimeout(ctx, minRemainingTime)
-			_ = cancel
-			return newCtx
+			return ctx
 		}
 
 		// Deadline is reasonable, use as-is
@@ -1540,20 +1563,23 @@ func enhanceContextWithDeadlines(ctx context.Context) context.Context {
 // metadataUnaryInterceptor adds default metadata to unary calls
 func metadataUnaryInterceptor(defaultMD map[string]string, defaultBin map[string]string) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		md := metadata.New(defaultMD)
+		md := metadata.New(nil)
+		// include default string metadata
+		for k, v := range defaultMD {
+			md[strings.ToLower(k)] = append(md[strings.ToLower(k)], v)
+		}
 		// Decode base64 values for -bin keys like grpcurl
 		for k, v := range defaultBin {
 			decoded, err := base64.StdEncoding.DecodeString(v)
 			if err != nil {
-				// fall back to raw string if decode fails
-				md[k] = append(md[k], v)
+				md[strings.ToLower(k)] = append(md[strings.ToLower(k)], v)
 				continue
 			}
-			md[k] = append(md[k], string(decoded))
+			md[strings.ToLower(k)] = append(md[strings.ToLower(k)], string(decoded))
 		}
 		if existingMD, ok := metadata.FromOutgoingContext(ctx); ok {
 			for k, v := range existingMD {
-				md[k] = append(md[k], v...)
+				md[strings.ToLower(k)] = append(md[strings.ToLower(k)], v...)
 			}
 		}
 		ctx = metadata.NewOutgoingContext(ctx, md)
@@ -1564,18 +1590,21 @@ func metadataUnaryInterceptor(defaultMD map[string]string, defaultBin map[string
 // metadataStreamInterceptor adds default metadata to streaming calls
 func metadataStreamInterceptor(defaultMD map[string]string, defaultBin map[string]string) grpc.StreamClientInterceptor {
 	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-		md := metadata.New(defaultMD)
+		md := metadata.New(nil)
+		for k, v := range defaultMD {
+			md[strings.ToLower(k)] = append(md[strings.ToLower(k)], v)
+		}
 		for k, v := range defaultBin {
 			decoded, err := base64.StdEncoding.DecodeString(v)
 			if err != nil {
-				md[k] = append(md[k], v)
+				md[strings.ToLower(k)] = append(md[strings.ToLower(k)], v)
 				continue
 			}
-			md[k] = append(md[k], string(decoded))
+			md[strings.ToLower(k)] = append(md[strings.ToLower(k)], string(decoded))
 		}
 		if existingMD, ok := metadata.FromOutgoingContext(ctx); ok {
 			for k, v := range existingMD {
-				md[k] = append(md[k], v...)
+				md[strings.ToLower(k)] = append(md[strings.ToLower(k)], v...)
 			}
 		}
 		ctx = metadata.NewOutgoingContext(ctx, md)
@@ -1735,6 +1764,8 @@ func (mr *MethodResolver) ResolveMethod(ctx context.Context, conn *grpc.ClientCo
 		outputPool: outputPool,
 	}
 	mr.cache.Store(key, entry)
+	// Also store by fully qualified method name for pool lookups
+	mr.cache.Store(method.GetFullyQualifiedName(), entry)
 
 	return method, nil
 }
