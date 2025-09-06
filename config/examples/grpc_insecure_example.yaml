@@ -11,13 +11,13 @@ output:
     address: 127.0.0.1:50051
     method: /ingest.Ingest/Stream
     
-    # TLS removed in this example set; using insecure transport for local testing
+    # Example using insecure transport for local testing
     proto_files: [ "ingest.proto", "google/protobuf/struct.proto" ]
     include_paths: [ "cmd/tools/grpc_test_server/pb" ]
     
     # Connection settings
     authority: ""
-    user_agent: bento-secure-client/1.0
+    user_agent: bento-insecure-client/1.0
     load_balancing_policy: pick_first
     
     # Timeouts and limits
@@ -47,6 +47,6 @@ output:
     
     # Request metadata
     default_metadata:
-      client-type: bento-secure
+      client-type: bento-insecure
       environment: local
       trace-enabled: "true"
