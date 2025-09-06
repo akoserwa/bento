@@ -459,7 +459,6 @@ func (u *UnifiedOutput) handleUnaryWrite(ctx context.Context, requestMsg *dynami
 
 	// Enhanced context handling with proper deadline propagation
 	callCtx := u.enhanceCallContext(ctx)
-	callCtx = context.WithValue(callCtx, ctxKeyConnMgr, u.connMgr)
 	var cancel context.CancelFunc
 
 	if u.cfg.CallTimeout > 0 {
@@ -593,7 +592,6 @@ func (u *UnifiedOutput) createClientStreamSession(ctx context.Context, sessionKe
 
 	// Enhanced context handling for streaming
 	streamCtx := u.enhanceCallContext(ctx)
-	streamCtx = context.WithValue(streamCtx, ctxKeyConnMgr, u.connMgr)
 	var cancel context.CancelFunc
 
 	if u.cfg.CallTimeout > 0 {
@@ -626,7 +624,6 @@ func (u *UnifiedOutput) createBidiStreamSession(ctx context.Context, sessionKey 
 
 	// Enhanced context handling for bidirectional streaming
 	streamCtx := u.enhanceCallContext(ctx)
-	streamCtx = context.WithValue(streamCtx, ctxKeyConnMgr, u.connMgr)
 	var cancel context.CancelFunc
 
 	if u.cfg.CallTimeout > 0 {

@@ -169,7 +169,6 @@ func (g *genericInput) handleUnaryCall(ctx context.Context, requestMsg *dynamic.
 
 	// Enhanced context handling with proper deadline propagation
 	callCtx := g.enhanceCallContext(ctx)
-	callCtx = context.WithValue(callCtx, ctxKeyConnMgr, g.connMgr)
 	var cancel context.CancelFunc
 
 	if g.cfg.CallTimeout > 0 {
@@ -287,7 +286,6 @@ func (g *genericInput) openStreamLocked(ctx context.Context, requestMsg *dynamic
 
 	// Enhanced context handling for server streaming
 	streamCtx := g.enhanceCallContext(ctx)
-	streamCtx = context.WithValue(streamCtx, ctxKeyConnMgr, g.connMgr)
 	var cancel context.CancelFunc
 
 	if g.cfg.CallTimeout > 0 {
